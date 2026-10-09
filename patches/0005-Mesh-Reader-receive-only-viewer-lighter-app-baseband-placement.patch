@@ -1,9 +1,9 @@
 From: osahv <osahv@users.noreply.github.com>
-Subject: [PATCH 5/5] Mesh Reader: receive-only viewer, lighter app, baseband placement
+Subject: [PATCH 5/5] Mesh Reader: receive-only viewer, Find screen, lighter app, baseband placement
 
 ---
 diff --git a/firmware/application/apps/ui_meshtastic.cpp b/firmware/application/apps/ui_meshtastic.cpp
-index c6181f9..3af98d3 100644
+index c6181f9..21dcd37 100644
 --- a/firmware/application/apps/ui_meshtastic.cpp
 +++ b/firmware/application/apps/ui_meshtastic.cpp
 @@ -6,7 +6,6 @@
@@ -1861,32 +1861,195 @@ index c6181f9..3af98d3 100644
  }
  
  size_t MeshtasticNodesView::online_count() const {
-@@ -3301,14 +1628,7 @@ void MeshtasticNodesView::move_selection(int delta) {
-     set_dirty();
+@@ -3302,12 +1629,10 @@ void MeshtasticNodesView::move_selection(int delta) {
  }
  
--void MeshtasticNodesView::open_selected() {
+ void MeshtasticNodesView::open_selected() {
 -    if (selected_ >= order_.size()) return;
--    const NodeEntry* e = node_db_.at(order_[selected_]);
--    if (!e || !e->active) return;
++    if (selected_ >= order_.size() || !own_) return;
+     const NodeEntry* e = node_db_.at(order_[selected_]);
+     if (!e || !e->active) return;
 -    auto* v = nav_.push<MeshtasticNodeDetailView>(node_db_, e->node_id, on_message_,
 -                                                  now_ticks_, on_stats_);
 -    v->set_on_exchange(on_exchange_);
--}
-+void MeshtasticNodesView::open_selected() {}
++    nav_.push<MeshtasticFinderView>(node_db_, e->node_id, *own_, on_set_me_);
+ }
  
  bool MeshtasticNodesView::on_encoder(const EncoderEvent delta) {
-     if (delta == 0) return true;
-@@ -3588,3542 +1908,337 @@ void MeshtasticSeenView::paint(Painter& painter) {
-                             to_string_dec_uint(static_cast<uint32_t>(scroll_ + 1)) + "-)");
+@@ -3448,6 +1773,165 @@ void MeshtasticNodesView::refresh() {
+     set_dirty();
  }
  
 +
++// ============================================================================
++// MeshtasticFinderView
++// ============================================================================
++
++MeshtasticFinderView* g_finder = nullptr;
++
++MeshtasticFinderView::MeshtasticFinderView(NavigationView& nav, NodeDB& node_db, uint32_t node_id, MeshOwn& own, std::function<void(uint32_t)> on_set_me)
++    : nav_(nav), node_db_(node_db), node_id_(node_id), own_(own), on_set_me_(std::move(on_set_me)) {
++    add_children({&button_close_, &button_me_});
++    button_close_.on_select = [this](Button&) { nav_.pop(); };
++    // "I carry this node": its own position reports become where I am.
++    button_me_.on_select = [this](Button&) {
++        if (on_set_me_) on_set_me_(node_id_);
++        set_dirty();
++    };
++    g_finder = this;
++    if (const NodeEntry* e = node_db_.find(node_id_)) {
++        last_seen_ = e->last_seen_uptime;
++        push_sample(e->last_rssi, static_cast<int8_t>(static_cast<float>(e->last_snr) * 2.0f));
++    }
++}
++
++MeshtasticFinderView::~MeshtasticFinderView() {
++    if (g_finder == this) g_finder = nullptr;
++}
++
++void MeshtasticFinderView::push_sample(int8_t rssi, int8_t snr2) {
++    if (n_ == NS) {
++        for (int i = 1; i < NS; i++) {
++            snr2_[i - 1] = snr2_[i];
++            rssi_[i - 1] = rssi_[i];
++        }
++        n_--;
++    }
++    snr2_[n_] = snr2;
++    rssi_[n_] = rssi;
++    n_++;
++}
++
++void MeshtasticFinderView::tick(uint32_t now_ticks) {
++    now_ticks_ = now_ticks;
++    const NodeEntry* e = node_db_.find(node_id_);
++    if (e && e->last_seen_uptime != last_seen_) {
++        last_seen_ = e->last_seen_uptime;
++        push_sample(e->last_rssi, static_cast<int8_t>(static_cast<float>(e->last_snr) * 2.0f));
++        set_dirty();
++    } else if ((now_ticks % 60u) == 0) {
++        set_dirty();  // the age counts up
++    }
++}
++
++void MeshtasticFinderView::paint(Painter& painter) {
++    const auto& bg = Theme::getInstance()->bg_darkest->background;
++    const auto& st = *Theme::getInstance()->fg_light;
++    const auto r = screen_rect();
++    const int x0 = r.left();
++    const int y0 = r.top();
++    painter.fill_rectangle({x0, y0, screen_width, 272}, bg);
++
++    const NodeEntry* e = node_db_.find(node_id_);
++    if (!e) {
++        painter.draw_string({x0, y0}, st, "node gone");
++        return;
++    }
++    draw_utf8({x0, y0}, utf8_cols(e->long_name[0] ? std::string(e->long_name) : to_string_hex(node_id_, 8), 29), st.foreground, bg);
++    const float snr = static_cast<float>(e->last_snr);
++    painter.draw_string({x0, y0 + 16}, st,
++                        "RSSI " + to_string_dec_int(e->last_rssi) + "  SNR " + to_string_dec_int(static_cast<int>(snr)) +
++                            "  hop " + to_string_dec_uint(e->hop_count));
++    const uint32_t age = (now_ticks_ > e->last_seen_uptime) ? (now_ticks_ - e->last_seen_uptime) / 60u : 0;
++    painter.draw_string({x0, y0 + 32}, st, "heard " + to_string_dec_uint(age) + " s ago, n=" + to_string_dec_uint(n_));
++
++    // Proximity by signal-to-noise: the figure that means something on a HackRF (RSSI here is in relative units).
++    const char* word = snr >= 8 ? "VERY CLOSE" : snr >= 3 ? "CLOSE" : snr >= -3 ? "MEDIUM" : snr >= -10 ? "FAR" : "VERY FAR";
++    // Trend: newest three samples against the three before them.
++    const char* trend = "";
++    Color tc = st.foreground;
++    if (n_ >= 6) {
++        int a = 0, b = 0;
++        for (int i = 0; i < 3; i++) {
++            a += snr2_[n_ - 1 - i];
++            b += snr2_[n_ - 4 - i];
++        }
++        const int d = (a - b) / 3;  // half-dB
++        if (d >= 2) {
++            trend = "  WARMER";
++            tc = Color::green();
++        } else if (d <= -2) {
++            trend = "  COLDER";
++            tc = Color::red();
++        } else {
++            trend = "  same";
++        }
++    }
++    painter.draw_string({x0, y0 + 52}, Theme::getInstance()->fg_yellow ? *Theme::getInstance()->fg_yellow : st, word);
++    painter.draw_string({x0 + 8 * 11, y0 + 52}, st, trend);
++    (void)tc;
++
++    // SNR history: one bar per packet, -20..+12 dB mapped to 0..60 px, newest on the right.
++    const int gy = y0 + 76 + 60;
++    painter.draw_hline({x0, gy}, screen_width, st.foreground);
++    for (int i = 0; i < n_; i++) {
++        int h = (snr2_[i] + 40) * 60 / 64;
++        if (h < 1) h = 1;
++        if (h > 60) h = 60;
++        const Color c = snr2_[i] >= 6 ? Color::green() : snr2_[i] >= -6 ? Color::yellow() : Color::red();
++        painter.fill_rectangle({x0 + i * 5, gy - h, 4, h}, c);
++    }
++
++    // Bearing and distance, when both ends have a position.
++    const int cy = y0 + 215;
++    // Where I am: live GPS, else the latest position of the node I carry (never the node being looked for).
++    float own_lat = 0.0f, own_lon = 0.0f;
++    bool have_own = false;
++    if (own_.gps) {
++        own_lat = own_.lat;
++        own_lon = own_.lon;
++        have_own = true;
++    } else if (own_.me && own_.me != node_id_) {
++        if (const NodeEntry* me = node_db_.find(own_.me)) {
++            if (me->has_position && me->position.valid) {
++                own_lat = static_cast<float>(static_cast<double>(me->position.latitude));
++                own_lon = static_cast<float>(static_cast<double>(me->position.longitude));
++                have_own = true;
++            }
++        }
++    }
++    if (e->has_position && e->position.valid && have_own) {
++        const float lat = static_cast<float>(static_cast<double>(e->position.latitude));
++        const float lon = static_cast<float>(static_cast<double>(e->position.longitude));
++        const float dy = (lat - own_lat) * 111320.0f;
++        const float dx = (lon - own_lon) * 111320.0f * cosf(own_lat * 0.0174533f);
++        const float dist = sqrtf(dx * dx + dy * dy);
++        float brg = atan2f(dx, dy) * 57.29578f;
++        if (brg < 0) brg += 360.0f;
++        static const char* const NAMES[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
++        const int ib = static_cast<int>((brg + 22.5f) / 45.0f) & 7;
++        painter.draw_string({x0, y0 + 216}, st, NAMES[ib]);
++        painter.draw_string({x0, y0 + 232}, st, to_string_dec_uint(static_cast<uint32_t>(brg)) + " deg");
++        painter.draw_string({x0, y0 + 248}, st,
++                            dist >= 1000.0f ? to_string_decimal(dist / 1000.0f, 1) + " km"
++                                            : to_string_dec_uint(static_cast<uint32_t>(dist)) + " m");
++        // North-up arrow: dots along the bearing with a block at the tip.
++        const int cx = x0 + 170, rad = 46;
++        const float sb = sinf(brg * 0.0174533f), cb = cosf(brg * 0.0174533f);
++        painter.fill_rectangle({cx - 1, cy - rad - 10, 3, 3}, st.foreground);
++        painter.draw_string({cx - 4, cy - rad - 28}, st, "N");
++        for (int t = 8; t < rad; t += 6)
++            painter.fill_rectangle({cx + static_cast<int>(t * sb) - 1, cy - static_cast<int>(t * cb) - 1, 3, 3}, Color::green());
++        painter.fill_rectangle({cx + static_cast<int>(rad * sb) - 3, cy - static_cast<int>(rad * cb) - 3, 7, 7}, Color::green());
++        painter.fill_rectangle({cx - 2, cy - 2, 5, 5}, st.foreground);
++    } else {
++        painter.draw_string({x0, y0 + 216}, st, !e->has_position ? "node sent no position" : "where am I? no GPS");
++        painter.draw_string({x0, y0 + 232}, st, !e->has_position ? "(walk, watch the trend)" : "open the node you carry");
++        painter.draw_string({x0, y0 + 248}, st, !e->has_position ? "" : "and press Me");
++    }
++}
++
  // ============================================================================
--// MeshtasticMapView
-+// MeshtasticView (receive-only controller)
+ // MeshtasticSeenView
  // ============================================================================
+@@ -3588,3507 +2072,155 @@ void MeshtasticSeenView::paint(Painter& painter) {
+                             to_string_dec_uint(static_cast<uint32_t>(scroll_ + 1)) + "-)");
+ }
  
+-// ============================================================================
+-// MeshtasticMapView
+-// ============================================================================
+-
 -MeshtasticMapView::MeshtasticMapView(NavigationView& nav,
 -                                     NodeDB& node_db,
 -                                     Rect parent_rect)
@@ -1904,121 +2067,7 @@ index c6181f9..3af98d3 100644
 -    button_resend_.on_select = [this](Button&) {
 -        if (on_resend_) on_resend_();
 -    };
-+namespace {
-+enum class K : uint8_t { U8,
-+                         U32,
-+                         I32,
-+                         BOOL,
-+                         FLOAT,
-+                         STR };
-+struct SettingDef {
-+    std::string_view name;
-+    uint16_t offset;
-+    K kind;
-+};
-+const SettingDef SETTING_DEFS[] = {
-+    {"region"sv, offsetof(MeshSettings, region_idx), K::U8},
-+    {"preset"sv, offsetof(MeshSettings, preset_idx), K::U8},
-+    {"n_long"sv, offsetof(MeshSettings, node_long_str), K::STR},
-+    {"n_short"sv, offsetof(MeshSettings, node_short_str), K::STR},
-+    {"node_id"sv, offsetof(MeshSettings, node_id), K::U32},
-+    {"role"sv, offsetof(MeshSettings, node_role), K::U8},
-+    {"gps_en"sv, offsetof(MeshSettings, gps_enabled), K::BOOL},
-+    {"hops"sv, offsetof(MeshSettings, hop_limit), K::U8},
-+    {"mqtt_ok"sv, offsetof(MeshSettings, mqtt_ok), K::BOOL},
-+    {"hw_model"sv, offsetof(MeshSettings, hw_model), K::U8},
-+    {"log"sv, offsetof(MeshSettings, logging), K::BOOL},
-+    {"rd_ack"sv, offsetof(MeshSettings, send_read_receipts), K::BOOL},
-+    {"listen"sv, offsetof(MeshSettings, listen_only), K::BOOL},
-+    {"astats"sv, offsetof(MeshSettings, answer_stats), K::BOOL},
-+    {"pchname"sv, offsetof(MeshSettings, primary_name), K::STR},
-+    {"rxlna"sv, offsetof(MeshSettings, rx_lna), K::U8},
-+    {"rxvga"sv, offsetof(MeshSettings, rx_vga), K::U8},
-+    {"rxamp"sv, offsetof(MeshSettings, rx_amp), K::U8},
-+    {"t_upm"sv, offsetof(MeshSettings, telemetry.up_mode), K::U8},
-+    {"t_uph"sv, offsetof(MeshSettings, telemetry.up_hours), K::U32},
-+    {"fix_lat"sv, offsetof(MeshSettings, fixed_lat), K::FLOAT},
-+    {"fix_lon"sv, offsetof(MeshSettings, fixed_lon), K::FLOAT},
-+    {"freq_hz"sv, offsetof(MeshSettings, freq_override_hz), K::U32},
-+    {"rand_min"sv, offsetof(MeshSettings, rand_min), K::U32},
-+    {"rand_mask"sv, offsetof(MeshSettings, rand_mask), K::U8},
-+    {"beep_rx"sv, offsetof(MeshSettings, beep_on_rx), K::BOOL},
-+    {"pki_en"sv, offsetof(MeshSettings, pki_enabled), K::BOOL},
-+    {"pki_priv"sv, offsetof(MeshSettings, pki_priv_hex), K::STR},
-+    {"fslot"sv, offsetof(MeshSettings, freq_slot), K::U8},
-+    {"cr"sv, offsetof(MeshSettings, coding_rate), K::U8},
-+    {"txpm"sv, offsetof(MeshSettings, tx_pwr_mode), K::U8},
-+    {"txpd"sv, offsetof(MeshSettings, tx_pwr_db), K::U8},
-+    {"hline"sv, offsetof(MeshSettings, chat.hist_lines), K::U32},
-+    {"niv_min"sv, offsetof(MeshSettings, nodeinfo_min), K::U32},
-+    {"nbr_min"sv, offsetof(MeshSettings, nbr_min), K::U32},
-+    {"ign_mqtt"sv, offsetof(MeshSettings, ignore_mqtt), K::BOOL},
-+    {"crcpol"sv, offsetof(MeshSettings, crc_policy), K::U8},
-+    {"sf_en"sv, offsetof(MeshSettings, sf_enabled), K::BOOL},
-+    {"sf_max"sv, offsetof(MeshSettings, sf_max), K::U32},
-+    {"sf_ttl"sv, offsetof(MeshSettings, sf_ttl_min), K::U32},
-+    {"keyrep"sv, offsetof(MeshSettings, key_repeat), K::BOOL},
-+    {"radiomode"sv, offsetof(MeshSettings, radio_mode), K::U8},
-+    {"echo"sv, offsetof(MeshSettings, echo_enabled), K::BOOL},
-+    {"echo_mask"sv, offsetof(MeshSettings, echo_mask), K::U8},
-+    {"echo_key"sv, offsetof(MeshSettings, echo_key), K::STR},
-+    {"c_time"sv, offsetof(MeshSettings, chat.time_mode), K::U8},
-+    {"c_name"sv, offsetof(MeshSettings, chat.name_mode), K::U8},
-+    {"c_db"sv, offsetof(MeshSettings, chat.show_db), K::BOOL},
-+    {"c_tech"sv, offsetof(MeshSettings, chat.show_tech), K::BOOL},
-+    {"c_save"sv, offsetof(MeshSettings, chat.save_count), K::U32},
-+    {"c_glyph"sv, offsetof(MeshSettings, chat.glyph_font), K::BOOL},
-+    {"c_sfnote"sv, offsetof(MeshSettings, chat.sf_notify), K::BOOL},
-+    {"c_bell"sv, offsetof(MeshSettings, chat.bell_alert), K::BOOL},
-+    {"c_fsize"sv, offsetof(MeshSettings, chat.font_size), K::U8},
-+    {"c_retry"sv, offsetof(MeshSettings, chat.tx_retries), K::U32},
-+    {"c_retrys"sv, offsetof(MeshSettings, chat.tx_retry_s), K::U32},
-+    {"t_bmode"sv, offsetof(MeshSettings, telemetry.batt_mode), K::U8},
-+    {"t_bpct"sv, offsetof(MeshSettings, telemetry.batt_pct), K::U8},
-+    {"t_vmode"sv, offsetof(MeshSettings, telemetry.volt_mode), K::U8},
-+    {"t_vdv"sv, offsetof(MeshSettings, telemetry.volt_dV), K::U8},
-+    {"t_umode"sv, offsetof(MeshSettings, telemetry.util_mode), K::U8},
-+    {"t_alt"sv, offsetof(MeshSettings, telemetry.fixed_alt_m), K::I32},
-+    {"t_sats"sv, offsetof(MeshSettings, telemetry.fixed_sats), K::U8},
-+    {"t_extra"sv, offsetof(MeshSettings, extra_pack), K::STR},
-+    {"t_uch"sv, offsetof(MeshSettings, telemetry.chutil_pct), K::U8},
-+    {"t_uair"sv, offsetof(MeshSettings, telemetry.airutil_pct), K::U8},
-+    {"t_posmin"sv, offsetof(MeshSettings, telemetry.pos_min), K::U8},
-+    {"t_telmin"sv, offsetof(MeshSettings, telemetry.tel_min), K::U8},
-+    {"c1_name"sv, offsetof(MeshSettings, ch_name[0]), K::STR},
-+    {"c1_key"sv, offsetof(MeshSettings, ch_key[0]), K::STR},
-+    {"c1_en"sv, offsetof(MeshSettings, ch_enabled[0]), K::BOOL},
-+    {"c2_name"sv, offsetof(MeshSettings, ch_name[1]), K::STR},
-+    {"c2_key"sv, offsetof(MeshSettings, ch_key[1]), K::STR},
-+    {"c2_en"sv, offsetof(MeshSettings, ch_enabled[1]), K::BOOL},
-+    {"c3_name"sv, offsetof(MeshSettings, ch_name[2]), K::STR},
-+    {"c3_key"sv, offsetof(MeshSettings, ch_key[2]), K::STR},
-+    {"c3_en"sv, offsetof(MeshSettings, ch_enabled[2]), K::BOOL},
-+    {"c4_name"sv, offsetof(MeshSettings, ch_name[3]), K::STR},
-+    {"c4_key"sv, offsetof(MeshSettings, ch_key[3]), K::STR},
-+    {"c4_en"sv, offsetof(MeshSettings, ch_enabled[3]), K::BOOL},
-+    {"c5_name"sv, offsetof(MeshSettings, ch_name[4]), K::STR},
-+    {"c5_key"sv, offsetof(MeshSettings, ch_key[4]), K::STR},
-+    {"c5_en"sv, offsetof(MeshSettings, ch_enabled[4]), K::BOOL},
-+    {"c6_name"sv, offsetof(MeshSettings, ch_name[5]), K::STR},
-+    {"c6_key"sv, offsetof(MeshSettings, ch_key[5]), K::STR},
-+    {"c6_en"sv, offsetof(MeshSettings, ch_enabled[5]), K::BOOL},
-+    {"c7_name"sv, offsetof(MeshSettings, ch_name[6]), K::STR},
-+    {"c7_key"sv, offsetof(MeshSettings, ch_key[6]), K::STR},
-+    {"c7_en"sv, offsetof(MeshSettings, ch_enabled[6]), K::BOOL},
-+    {"c8_name"sv, offsetof(MeshSettings, ch_name[7]), K::STR},
-+    {"c8_key"sv, offsetof(MeshSettings, ch_key[7]), K::STR},
-+    {"c8_en"sv, offsetof(MeshSettings, ch_enabled[7]), K::BOOL},
-+    {"c9_name"sv, offsetof(MeshSettings, ch_name[8]), K::STR},
-+    {"c9_key"sv, offsetof(MeshSettings, ch_key[8]), K::STR},
-+    {"c9_en"sv, offsetof(MeshSettings, ch_enabled[8]), K::BOOL},
-+    {"c10_name"sv, offsetof(MeshSettings, ch_name[9]), K::STR},
-+    {"c10_key"sv, offsetof(MeshSettings, ch_key[9]), K::STR},
-+    {"c10_en"sv, offsetof(MeshSettings, ch_enabled[9]), K::BOOL},
-+    {"act_ch"sv, offsetof(MeshSettings, active_channel), K::U8},
-+};
-+}  // namespace
- 
+-
 -    button_open_map_.on_select = [this](Button&) {
 -        // Center on our own fix if we have one, else on the first node with a
 -        // position (so the map isn't stranded at 0,0 when GPS has no fix yet).
@@ -2034,32 +2083,7 @@ index c6181f9..3af98d3 100644
 -                    break;
 -                }
 -            }
-+__attribute__((noinline)) SettingBindings MeshtasticView::settings_bindings() {
-+    SettingBindings b;
-+    b.reserve(sizeof(SETTING_DEFS) / sizeof(SETTING_DEFS[0]));
-+    auto* base = reinterpret_cast<uint8_t*>(&cfg_);
-+    for (const auto& d : SETTING_DEFS) {
-+        void* p = base + d.offset;
-+        switch (d.kind) {
-+            case K::U8:
-+                b.emplace_back(d.name, static_cast<uint8_t*>(p));
-+                break;
-+            case K::U32:
-+                b.emplace_back(d.name, static_cast<uint32_t*>(p));
-+                break;
-+            case K::I32:
-+                b.emplace_back(d.name, static_cast<int32_t*>(p));
-+                break;
-+            case K::BOOL:
-+                b.emplace_back(d.name, static_cast<bool*>(p));
-+                break;
-+            case K::FLOAT:
-+                b.emplace_back(d.name, static_cast<float*>(p));
-+                break;
-+            case K::STR:
-+                b.emplace_back(d.name, static_cast<std::string*>(p));
-+                break;
-         }
+-        }
 -
 -        if (!map_would_fit(nullptr)) return;
 -        auto* map = nav_.push<GeoMapView>(
@@ -2314,11 +2338,12 @@ index c6181f9..3af98d3 100644
 -    up_text_ = s;
 -    text_up_.set(s);
 -}
--
--// ============================================================================
+ 
+ // ============================================================================
 -// Telemetry pages
--// ============================================================================
--
++// MeshtasticView (receive-only controller)
+ // ============================================================================
+ 
 -MeshTelemetryMenuView::MeshTelemetryMenuView(NavigationView& nav, MeshSettings& cfg, MeshSettingsHooks& hooks)
 -    : MeshSettingsPage(nav, cfg, hooks) {
 -    add_children({&button_device_, &button_position_, &button_sensors_, &button_timing_});
@@ -2571,11 +2596,10 @@ index c6181f9..3af98d3 100644
 -        row_check_[row]->hidden(true);
 -        row_value_[row]->hidden(true);
 -        row_unit_[row]->hidden(true);
-     }
+-    }
 -    set_dirty();
-+    return b;
- }
- 
+-}
+-
 -MeshTelemetryTimingPageView::MeshTelemetryTimingPageView(NavigationView& nav,
 -                                                         MeshSettings& cfg,
 -                                                         MeshSettingsHooks& hooks)
@@ -2591,13 +2615,7 @@ index c6181f9..3af98d3 100644
 -    field_tel_min_.on_change = [this](int32_t v) {
 -        cfg_.telemetry.tel_min = static_cast<uint8_t>(v);
 -        changed();
-+size_t MeshtasticView::derive_channel_key(const std::string& text, uint8_t out[32]) {
-+    const auto all_hex = [&](size_t n) {
-+        if (text.size() != n) return false;
-+        for (size_t i = 0; i < n; i++)
-+            if (hex_digit(text[i]) < 0) return false;
-+        return true;
-     };
+-    };
 -}
 -
 -// ============================================================================
@@ -2973,11 +2991,7 @@ index c6181f9..3af98d3 100644
 -            e->long_name[0] ? std::string(e->long_name) : "!" + to_string_hex(sel.node, 8),
 -            e->has_pubkey ? "contact  [key]" : "contact  [no key]");
 -        return;
-+    if (all_hex(64)) {  // exact 64 hex -> raw AES-256 key (stock nodes with a 32 byte PSK)
-+        for (int i = 0; i < 32; i++)
-+            out[i] = static_cast<uint8_t>((hex_digit(text[2 * i]) << 4) | hex_digit(text[2 * i + 1]));
-+        return 32;
-     }
+-    }
 -    const int i = (sel.kind == Row::Channel) ? sel.slot : -1;
 -    uint8_t key[32];
 -    size_t key_len = 0;
@@ -3023,11 +3037,7 @@ index c6181f9..3af98d3 100644
 -        qr_url_ = meshtastic::channel_share_url(sh);
 -        l1 = std::string("Channel ") + meshtastic::PRESET_CHANNEL_NAMES[preset_idx_];
 -        l2 = "public, well known key";
-+    if (all_hex(32)) {  // exact 32 hex -> raw AES-128 key
-+        for (int i = 0; i < 16; i++)
-+            out[i] = static_cast<uint8_t>((hex_digit(text[2 * i]) << 4) | hex_digit(text[2 * i + 1]));
-+        return 16;
-     }
+-    }
 -    nav_.push<MeshtasticQRView>(qr_url_, l1, l2);
 -}
 -
@@ -5150,16 +5160,9 @@ index c6181f9..3af98d3 100644
 -    if (tx_pending_ && !is_transmitting_ && tx_delay_ > 0 && !rx_hold) {
 -        if (--tx_delay_ == 0)
 -            trigger_tx();
-+    for (int i = 0; i < 16; i++) out[i] = 0;  // else derive from passphrase
-+    if (text.empty()) {
-+        out[0] = 1;
-+        return 16;
-     }
-+    for (size_t i = 0; i < 16; i++)
-+        out[i] = static_cast<uint8_t>(text[i % text.size()] ^ (0x9E * (i + 1)));
-+    return 16;
- }
- 
+-    }
+-}
+-
 -void MeshtasticView::on_lora_rx_status(const LoRaRxStatusMessage* msg) {
 -    if (!msg) return;
 -    rx_busy_ = msg->receiving;
@@ -5197,13 +5200,7 @@ index c6181f9..3af98d3 100644
 -    router_.note_tx();
 -    return true;
 -}
-+MeshtasticView::MeshtasticView(NavigationView& nav)
-+    : nav_(nav),
-+      chat_view_(nav, router_, node_db_, {0, 3 * 8, screen_width, screen_height - 40}),
-+      nodes_view_(nav, node_db_, {0, 3 * 8, screen_width, screen_height - 40}) {
-+    add_children({&tab_view_, &chat_view_, &nodes_view_});
-+    nodes_view_.hidden(true);
- 
+-
 -void MeshtasticView::store_and_forward(const meshtastic::MeshPacket& pkt) {
 -    if (!cfg_.sf_enabled || pkt.data.portnum != PortNum::TEXT_MESSAGE) return;
 -    if (pkt.header.from == cfg_.node_id) return;
@@ -5234,22 +5231,7 @@ index c6181f9..3af98d3 100644
 -                                                          to_string_dec_uint(static_cast<uint32_t>(sf_replay_.size())) +
 -                                                          " msgs\n");
 -        return;  // don't store the request itself
-+    // The node address is only used to filter unicast frames; give a fresh install one.
-+    if (cfg_.node_id == 0xDEADBEEFu || cfg_.node_id == 0 ||
-+        cfg_.node_id == meshtastic::BROADCAST_ADDR) {
-+        const auto now = rtc_time::now();
-+        uint32_t x = (static_cast<uint32_t>(now.year()) << 26) ^
-+                     (static_cast<uint32_t>(now.day()) << 21) ^
-+                     (static_cast<uint32_t>(now.hour()) << 16) ^
-+                     (static_cast<uint32_t>(now.minute()) << 8) ^
-+                     static_cast<uint32_t>(now.second()) ^ chCoreStatus();
-+        x ^= x << 13;
-+        x ^= x >> 17;
-+        x ^= x << 5;
-+        x *= 0x9e3779b9u;
-+        if (x == 0 || x == meshtastic::BROADCAST_ADDR) x = 0x0BADC0DEu;
-+        cfg_.node_id = x;
-     }
+-    }
 -    // A message addressed to US is not stored. We are its destination, not a waypoint on
 -    // the way to one: it has arrived, it is on screen, and nobody can ever be handed it
 -    // back - replay gives a message to the node it was addressed to, and we do not ask
@@ -5278,11 +5260,7 @@ index c6181f9..3af98d3 100644
 -                                                      (wrapped ? "+/" : "/") + to_string_dec_uint(static_cast<uint32_t>(cap)) +
 -                                                      " from " + to_string_hex(pkt.header.from & 0xFFFF, 4) + "\n");
 -}
-+    // Earlier builds stored a size index here rather than a height in pixels.
-+    cfg_.chat.font_size = (cfg_.chat.font_size < 12) ? 8 : 16;
-+    // Messages only: no status lines, no history banner.
-+    cfg_.chat.show_tech = false;
- 
+-
 -std::string MeshtasticView::active_channel_name() const {
 -    // The primary channel is named after the preset unless the user has renamed it -
 -    // the same name the channels screen shows, and the same one the channel hash is
@@ -5300,11 +5278,7 @@ index c6181f9..3af98d3 100644
 -    }
 -    return cfg_.ch_name[cfg_.active_channel - 1];
 -}
-+    // One press, one step: with repeat on, holding a key a moment too long runs a menu
-+    // past where you wanted it. Restored on the way out.
-+    saved_repeat_ = get_switches_repeat_config();
-+    if (!cfg_.key_repeat) set_switches_repeat_config(SwitchesState{});
- 
+-
 -std::string MeshtasticView::random_channel_key() {
 -    // Seeded from the RF noise pool that every received packet stirs, so the key is
 -    // not a function of the boot clock alone. 32 hex characters is what
@@ -5318,11 +5292,7 @@ index c6181f9..3af98d3 100644
 -    }
 -    return out;
 -}
-+    router_.set_local_node(cfg_.node_id, DEFAULT_PSK, sizeof(DEFAULT_PSK));
-+    // Reading files, deriving the channel table and starting the receiver all happen on
-+    // the first timer tick - see start_deferred(): they reach the card or the baseband,
-+    // and this constructor may run deep inside the launcher's touch dispatch.
- 
+-
 -void MeshtasticView::broadcast_nodeinfo() {
 -    uint8_t* const buf = pkt_scratch;
 -    size_t len = router_.build_nodeinfo_tx(buf, sizeof(pkt_scratch),
@@ -5335,27 +5305,7 @@ index c6181f9..3af98d3 100644
 -                                 (router_.pki_enabled() ? " +key: " : ": ") +
 -                                 cfg_.node_long_name + "\n");
 -}
-+    router_.set_on_packet([this](const MeshPacket& pkt) {
-+        // Set our clock from the mesh, once, and only while it is still sitting at the
-+        // 1980 the RTC powers up with - never over a time the user set themselves.
-+        if (!rtc_is_set()) {
-+            uint32_t peer_time = 0;
-+            if (pkt.data.portnum == PortNum::POSITION) {
-+                if (const NodeEntry* e = node_db_.find(pkt.header.from))
-+                    peer_time = e->position.timestamp;
-+            } else if (pkt.data.portnum == PortNum::TELEMETRY) {
-+                peer_time = node_db_.last_telemetry().timestamp;
-+            }
-+            if (peer_time > 1704067200u && peer_time < 4102444800u) {
-+                rtc::RTC t;
-+                unix_to_rtc(peer_time, t);
-+                rtc_time::set(t);
-+            }
-+        }
-+        chat_view_.on_packet(pkt);
-+        nodes_view_.refresh();
-+    });
- 
+-
 -void MeshtasticView::send_bell(uint8_t channel, uint32_t node) {
 -    // A message whose whole content is the bell character: Meshtastic clients treat it
 -    // as an alert and ring, which is the point - it needs no words.
@@ -5378,18 +5328,8 @@ index c6181f9..3af98d3 100644
 -                                 (to_node ? to_string_hex(node & 0xFFFF, 4)
 -                                          : "channel " + to_string_dec_uint(channel)) +
 -                                 "\n");
-+    chat_view_.set_gains(cfg_.rx_lna, cfg_.rx_vga, cfg_.rx_amp);
-+    chat_view_.set_on_gain([this](uint8_t lna, uint8_t vga, uint8_t amp) {
-+        cfg_.rx_lna = lna;
-+        cfg_.rx_vga = vga;
-+        cfg_.rx_amp = amp;
-+        settings_.save();
-+    });
-+    chat_view_.set_on_channels([this]() { cycle_channel(); });
-+    chat_view_.set_beep_flag(&cfg_.beep_on_rx);
-+    chat_view_.set_display(cfg_.chat);
- }
- 
+-}
+-
 -void MeshtasticView::broadcast_position() {
 -    // Without a live fix everything about the position comes from the settings - and
 -    // that has to include the coordinates. Only the altitude and the satellite count
@@ -5410,33 +5350,16 @@ index c6181f9..3af98d3 100644
 -        if (cfg_.fixed_lat == 0.0f && cfg_.fixed_lon == 0.0f) {
 -            chat_view_.write_console("* no position set\n");
 -            return;
-+MeshtasticView::~MeshtasticView() {
-+    // The nodes still in memory go to the card too, so the All list survives a restart.
-+    {
-+        const uint32_t unix_now = now_unix();
-+        for (size_t i = 0; i < node_db_.count(); i++) {
-+            const NodeEntry* e = node_db_.at(i);
-+            if (e && e->active && e->node_id) seen_put(NodeDB::make_record(*e, unix_now, uptime_ticks_));
-         }
-     }
+-        }
+-    }
 -    // Stamped only once the clock is real; the encoder drops the field when it is 0,
 -    // which reads as "undated" rather than as 1980.
 -    gps_position_.timestamp = now_unix();
 -    uint8_t* const buf = pkt_scratch;
 -    size_t len = router_.build_position_tx(buf, sizeof(pkt_scratch), gps_position_);
 -    if (len > 0 && queue_tx(buf, len)) announce_position();
-+    set_switches_repeat_config(saved_repeat_);  // hand the keys back as we found them
-+    audio::output::stop();
-+    // Clear the models' enabled_ flags (not just radio::disable()): they are global
-+    // singletons that outlive this view; a stale flag made the next launch message a
-+    // shut-down M4 before run_image() - an infinite send_message() spin.
-+    receiver_model.disable();
-+    transmitter_model.disable();
-+    baseband::shutdown();
-+    // Let the M4 finish its processor teardown before anyone can run_image() again.
-+    chThdSleepMilliseconds(50);
- }
- 
+-}
+-
 -void MeshtasticView::broadcast_neighborinfo() {
 -    // Meshtastic keeps this off the public channel: runOnce() only puts it on the air
 -    // when the primary channel is not the default one, or the frequency slot is not the
@@ -5447,10 +5370,8 @@ index c6181f9..3af98d3 100644
 -                                                     cfg_.nbr_min * 60u);
 -    if (len > 0 && queue_tx(buf, len))
 -        chat_view_.write_console("* neighbors sent\n");
-+void MeshtasticView::focus() {
-+    tab_view_.focus();
- }
- 
+-}
+-
 -void MeshtasticView::announce_position() {
 -    // Identity, position and metrics travel as three separate packets - NodeInfo says
 -    // only who we are - so each says so for itself. The coordinates themselves are on
@@ -5458,11 +5379,8 @@ index c6181f9..3af98d3 100644
 -    const bool live = has_gps_fix_ && cfg_.gps_enabled;
 -    chat_view_.write_console(std::string("* position sent (") +
 -                             (live ? "live GPS" : "fixed") + ")\n");
-+void MeshtasticView::set_parent_rect(const Rect new_parent_rect) {
-+    View::set_parent_rect(new_parent_rect);
-+    tab_view_.set_parent_rect({0, 0, new_parent_rect.width(), 3 * 8});
- }
- 
+-}
+-
 -void MeshtasticView::read_battery() {
 -    // BatteryStateMessage is only emitted by the Battery Info app, so read the
 -    // fuel gauge directly (i2c0 is free during normal operation - the charger
@@ -5492,11 +5410,8 @@ index c6181f9..3af98d3 100644
 -    telemetry_.has_device = true;
 -    map_view_.set_battery(batt_pct_, batt_mv_ / 1000.0f,
 -                          batt_have_current_ && batt_charging_);
-+uint8_t MeshtasticView::active_coding_rate() const {
-+    const uint8_t cr = cfg_.coding_rate;
-+    return (cr >= 5 && cr <= 8) ? cr : meshtastic::MODEM_PRESETS[cfg_.preset_idx].cr;
- }
- 
+-}
+-
 -void MeshtasticView::on_environment_update(const EnvironmentDataMessage* msg) {
 -    if (!msg) return;
 -    telemetry_.temperature = msg->temperature;
@@ -5504,11 +5419,8 @@ index c6181f9..3af98d3 100644
 -    telemetry_.barometric_pressure = msg->pressure;
 -    telemetry_.has_env = true;
 -    map_view_.set_environment(msg->temperature, msg->humidity, msg->pressure);
-+void MeshtasticView::resend_lora_config() {
-+    const auto& preset = MODEM_PRESETS[cfg_.preset_idx];
-+    baseband::set_lora_config(preset.sf, preset.bw_hz, active_coding_rate(), cfg_.node_id);
- }
- 
+-}
+-
 -void MeshtasticView::apply_telemetry_overrides(TelemetryData& t) const {
 -    // Uptime first: the callers used to write the real figure AFTER this ran, which
 -    // would have overwritten a custom one.
@@ -5565,20 +5477,129 @@ index c6181f9..3af98d3 100644
 -            t.send_util = true;
 -            t.has_device = true;
 -            break;
-+void MeshtasticView::start_deferred() {
-+    apply_channels();
-+    if (cfg_.logging) {
-+        logger_ = std::make_unique<MeshtasticLogger>();
-+        logger_->append(u"/LOGS/mesh_rx.csv");
-     }
+-    }
 -    // Environment and air quality are entirely table-driven now: temperature, humidity
 -    // and pressure are entries in the sensor table like everything else, so nothing is
 -    // added here - broadcast_telemetry turns on whichever message their fields belong to.
 -    t.send_env_base = false;
 -    t.has_env = false;
 -    t.has_air = false;
-+    start_rx();
- }
+-}
++namespace {
++enum class K : uint8_t { U8,
++                         U32,
++                         I32,
++                         BOOL,
++                         FLOAT,
++                         STR };
++struct SettingDef {
++    std::string_view name;
++    uint16_t offset;
++    K kind;
++};
++const SettingDef SETTING_DEFS[] = {
++    {"region"sv, offsetof(MeshSettings, region_idx), K::U8},
++    {"preset"sv, offsetof(MeshSettings, preset_idx), K::U8},
++    {"n_long"sv, offsetof(MeshSettings, node_long_str), K::STR},
++    {"n_short"sv, offsetof(MeshSettings, node_short_str), K::STR},
++    {"node_id"sv, offsetof(MeshSettings, node_id), K::U32},
++    {"role"sv, offsetof(MeshSettings, node_role), K::U8},
++    {"gps_en"sv, offsetof(MeshSettings, gps_enabled), K::BOOL},
++    {"hops"sv, offsetof(MeshSettings, hop_limit), K::U8},
++    {"mqtt_ok"sv, offsetof(MeshSettings, mqtt_ok), K::BOOL},
++    {"hw_model"sv, offsetof(MeshSettings, hw_model), K::U8},
++    {"log"sv, offsetof(MeshSettings, logging), K::BOOL},
++    {"rd_ack"sv, offsetof(MeshSettings, send_read_receipts), K::BOOL},
++    {"listen"sv, offsetof(MeshSettings, listen_only), K::BOOL},
++    {"astats"sv, offsetof(MeshSettings, answer_stats), K::BOOL},
++    {"pchname"sv, offsetof(MeshSettings, primary_name), K::STR},
++    {"rxlna"sv, offsetof(MeshSettings, rx_lna), K::U8},
++    {"rxvga"sv, offsetof(MeshSettings, rx_vga), K::U8},
++    {"rxamp"sv, offsetof(MeshSettings, rx_amp), K::U8},
++    {"t_upm"sv, offsetof(MeshSettings, telemetry.up_mode), K::U8},
++    {"t_uph"sv, offsetof(MeshSettings, telemetry.up_hours), K::U32},
++    {"fix_lat"sv, offsetof(MeshSettings, fixed_lat), K::FLOAT},
++    {"fix_lon"sv, offsetof(MeshSettings, fixed_lon), K::FLOAT},
++    {"freq_hz"sv, offsetof(MeshSettings, freq_override_hz), K::U32},
++    {"rand_min"sv, offsetof(MeshSettings, rand_min), K::U32},
++    {"rand_mask"sv, offsetof(MeshSettings, rand_mask), K::U8},
++    {"beep_rx"sv, offsetof(MeshSettings, beep_on_rx), K::BOOL},
++    {"pki_en"sv, offsetof(MeshSettings, pki_enabled), K::BOOL},
++    {"pki_priv"sv, offsetof(MeshSettings, pki_priv_hex), K::STR},
++    {"fslot"sv, offsetof(MeshSettings, freq_slot), K::U8},
++    {"cr"sv, offsetof(MeshSettings, coding_rate), K::U8},
++    {"txpm"sv, offsetof(MeshSettings, tx_pwr_mode), K::U8},
++    {"txpd"sv, offsetof(MeshSettings, tx_pwr_db), K::U8},
++    {"hline"sv, offsetof(MeshSettings, chat.hist_lines), K::U32},
++    {"niv_min"sv, offsetof(MeshSettings, nodeinfo_min), K::U32},
++    {"nbr_min"sv, offsetof(MeshSettings, nbr_min), K::U32},
++    {"ign_mqtt"sv, offsetof(MeshSettings, ignore_mqtt), K::BOOL},
++    {"crcpol"sv, offsetof(MeshSettings, crc_policy), K::U8},
++    {"sf_en"sv, offsetof(MeshSettings, sf_enabled), K::BOOL},
++    {"sf_max"sv, offsetof(MeshSettings, sf_max), K::U32},
++    {"sf_ttl"sv, offsetof(MeshSettings, sf_ttl_min), K::U32},
++    {"keyrep"sv, offsetof(MeshSettings, key_repeat), K::BOOL},
++    {"radiomode"sv, offsetof(MeshSettings, radio_mode), K::U8},
++    {"echo"sv, offsetof(MeshSettings, echo_enabled), K::BOOL},
++    {"echo_mask"sv, offsetof(MeshSettings, echo_mask), K::U8},
++    {"echo_key"sv, offsetof(MeshSettings, echo_key), K::STR},
++    {"c_time"sv, offsetof(MeshSettings, chat.time_mode), K::U8},
++    {"c_name"sv, offsetof(MeshSettings, chat.name_mode), K::U8},
++    {"c_db"sv, offsetof(MeshSettings, chat.show_db), K::BOOL},
++    {"c_tech"sv, offsetof(MeshSettings, chat.show_tech), K::BOOL},
++    {"c_save"sv, offsetof(MeshSettings, chat.save_count), K::U32},
++    {"c_glyph"sv, offsetof(MeshSettings, chat.glyph_font), K::BOOL},
++    {"c_sfnote"sv, offsetof(MeshSettings, chat.sf_notify), K::BOOL},
++    {"c_bell"sv, offsetof(MeshSettings, chat.bell_alert), K::BOOL},
++    {"c_fsize"sv, offsetof(MeshSettings, chat.font_size), K::U8},
++    {"c_retry"sv, offsetof(MeshSettings, chat.tx_retries), K::U32},
++    {"c_retrys"sv, offsetof(MeshSettings, chat.tx_retry_s), K::U32},
++    {"t_bmode"sv, offsetof(MeshSettings, telemetry.batt_mode), K::U8},
++    {"t_bpct"sv, offsetof(MeshSettings, telemetry.batt_pct), K::U8},
++    {"t_vmode"sv, offsetof(MeshSettings, telemetry.volt_mode), K::U8},
++    {"t_vdv"sv, offsetof(MeshSettings, telemetry.volt_dV), K::U8},
++    {"t_umode"sv, offsetof(MeshSettings, telemetry.util_mode), K::U8},
++    {"t_alt"sv, offsetof(MeshSettings, telemetry.fixed_alt_m), K::I32},
++    {"t_sats"sv, offsetof(MeshSettings, telemetry.fixed_sats), K::U8},
++    {"t_extra"sv, offsetof(MeshSettings, extra_pack), K::STR},
++    {"t_uch"sv, offsetof(MeshSettings, telemetry.chutil_pct), K::U8},
++    {"t_uair"sv, offsetof(MeshSettings, telemetry.airutil_pct), K::U8},
++    {"t_posmin"sv, offsetof(MeshSettings, telemetry.pos_min), K::U8},
++    {"t_telmin"sv, offsetof(MeshSettings, telemetry.tel_min), K::U8},
++    {"c1_name"sv, offsetof(MeshSettings, ch_name[0]), K::STR},
++    {"c1_key"sv, offsetof(MeshSettings, ch_key[0]), K::STR},
++    {"c1_en"sv, offsetof(MeshSettings, ch_enabled[0]), K::BOOL},
++    {"c2_name"sv, offsetof(MeshSettings, ch_name[1]), K::STR},
++    {"c2_key"sv, offsetof(MeshSettings, ch_key[1]), K::STR},
++    {"c2_en"sv, offsetof(MeshSettings, ch_enabled[1]), K::BOOL},
++    {"c3_name"sv, offsetof(MeshSettings, ch_name[2]), K::STR},
++    {"c3_key"sv, offsetof(MeshSettings, ch_key[2]), K::STR},
++    {"c3_en"sv, offsetof(MeshSettings, ch_enabled[2]), K::BOOL},
++    {"c4_name"sv, offsetof(MeshSettings, ch_name[3]), K::STR},
++    {"c4_key"sv, offsetof(MeshSettings, ch_key[3]), K::STR},
++    {"c4_en"sv, offsetof(MeshSettings, ch_enabled[3]), K::BOOL},
++    {"c5_name"sv, offsetof(MeshSettings, ch_name[4]), K::STR},
++    {"c5_key"sv, offsetof(MeshSettings, ch_key[4]), K::STR},
++    {"c5_en"sv, offsetof(MeshSettings, ch_enabled[4]), K::BOOL},
++    {"c6_name"sv, offsetof(MeshSettings, ch_name[5]), K::STR},
++    {"c6_key"sv, offsetof(MeshSettings, ch_key[5]), K::STR},
++    {"c6_en"sv, offsetof(MeshSettings, ch_enabled[5]), K::BOOL},
++    {"c7_name"sv, offsetof(MeshSettings, ch_name[6]), K::STR},
++    {"c7_key"sv, offsetof(MeshSettings, ch_key[6]), K::STR},
++    {"c7_en"sv, offsetof(MeshSettings, ch_enabled[6]), K::BOOL},
++    {"c8_name"sv, offsetof(MeshSettings, ch_name[7]), K::STR},
++    {"c8_key"sv, offsetof(MeshSettings, ch_key[7]), K::STR},
++    {"c8_en"sv, offsetof(MeshSettings, ch_enabled[7]), K::BOOL},
++    {"c9_name"sv, offsetof(MeshSettings, ch_name[8]), K::STR},
++    {"c9_key"sv, offsetof(MeshSettings, ch_key[8]), K::STR},
++    {"c9_en"sv, offsetof(MeshSettings, ch_enabled[8]), K::BOOL},
++    {"c10_name"sv, offsetof(MeshSettings, ch_name[9]), K::STR},
++    {"c10_key"sv, offsetof(MeshSettings, ch_key[9]), K::STR},
++    {"c10_en"sv, offsetof(MeshSettings, ch_enabled[9]), K::BOOL},
++    {"mynode"sv, offsetof(MeshSettings, my_node), K::STR},
++    {"act_ch"sv, offsetof(MeshSettings, active_channel), K::U8},
++};
++}  // namespace
  
 -void MeshtasticView::broadcast_telemetry() {
 -    read_battery();
@@ -5601,30 +5622,41 @@ index c6181f9..3af98d3 100644
 -        switch (d.variant) {
 -            case TelemetryData::ENVIRONMENT:
 -                tx.has_env = true;
--                break;
++__attribute__((noinline)) SettingBindings MeshtasticView::settings_bindings() {
++    SettingBindings b;
++    b.reserve(sizeof(SETTING_DEFS) / sizeof(SETTING_DEFS[0]));
++    auto* base = reinterpret_cast<uint8_t*>(&cfg_);
++    for (const auto& d : SETTING_DEFS) {
++        void* p = base + d.offset;
++        switch (d.kind) {
++            case K::U8:
++                b.emplace_back(d.name, static_cast<uint8_t*>(p));
++                break;
++            case K::U32:
++                b.emplace_back(d.name, static_cast<uint32_t*>(p));
+                 break;
 -            case TelemetryData::AIR_QUALITY:
 -                tx.has_air = true;
--                break;
++            case K::I32:
++                b.emplace_back(d.name, static_cast<int32_t*>(p));
+                 break;
 -            case TelemetryData::POWER:
 -                have_power = true;
--                break;
++            case K::BOOL:
++                b.emplace_back(d.name, static_cast<bool*>(p));
+                 break;
 -            case TelemetryData::HEALTH:
 -                have_health = true;
--                break;
++            case K::FLOAT:
++                b.emplace_back(d.name, static_cast<float*>(p));
+                 break;
 -            default:
--                break;
--        }
--    }
-+void MeshtasticView::start_rx() {
-+    // Clear the enabled flags before the set_*() calls below: while set, each
-+    // ReceiverModel::set_*() messages the baseband, and here the M4 image is down.
-+    receiver_model.disable();
-+    transmitter_model.disable();
-+    baseband::shutdown();
-+    // shutdown() returns once the M4 consumes the message, not when its teardown ends;
-+    // run_image() below hard-resets the M4.
-+    chThdSleepMilliseconds(30);
- 
++            case K::STR:
++                b.emplace_back(d.name, static_cast<std::string*>(p));
+                 break;
+         }
+     }
+-
 -    // Nothing to report until we've seen a real reading or the user set a custom.
 -    if (!tx.has_device && !tx.has_env && !tx.has_air && !have_power && !have_health)
 -        return;
@@ -5651,7 +5683,159 @@ index c6181f9..3af98d3 100644
 -                                             "power", "health"};
 -        chat_view_.write_console(std::string("* telemetry sent (") + kinds[v] + ")\n");
 -    }
--}
++    return b;
+ }
+ 
+ size_t MeshtasticView::derive_channel_key(const std::string& text, uint8_t out[32]) {
+@@ -7118,12 +2250,175 @@ size_t MeshtasticView::derive_channel_key(const std::string& text, uint8_t out[3
+     return 16;
+ }
+ 
++MeshtasticView::MeshtasticView(NavigationView& nav)
++    : nav_(nav),
++      chat_view_(nav, router_, node_db_, {0, 3 * 8, screen_width, screen_height - 40}),
++      nodes_view_(nav, node_db_, {0, 3 * 8, screen_width, screen_height - 40}) {
++    add_children({&tab_view_, &chat_view_, &nodes_view_});
++    nodes_view_.hidden(true);
++
++    // The node address is only used to filter unicast frames; give a fresh install one.
++    if (cfg_.node_id == 0xDEADBEEFu || cfg_.node_id == 0 ||
++        cfg_.node_id == meshtastic::BROADCAST_ADDR) {
++        const auto now = rtc_time::now();
++        uint32_t x = (static_cast<uint32_t>(now.year()) << 26) ^
++                     (static_cast<uint32_t>(now.day()) << 21) ^
++                     (static_cast<uint32_t>(now.hour()) << 16) ^
++                     (static_cast<uint32_t>(now.minute()) << 8) ^
++                     static_cast<uint32_t>(now.second()) ^ chCoreStatus();
++        x ^= x << 13;
++        x ^= x >> 17;
++        x ^= x << 5;
++        x *= 0x9e3779b9u;
++        if (x == 0 || x == meshtastic::BROADCAST_ADDR) x = 0x0BADC0DEu;
++        cfg_.node_id = x;
++    }
++    // Earlier builds stored a size index here rather than a height in pixels.
++    cfg_.chat.font_size = (cfg_.chat.font_size < 12) ? 8 : 16;
++    // Messages only: no status lines, no history banner.
++    cfg_.chat.show_tech = false;
++
++    // One press, one step: with repeat on, holding a key a moment too long runs a menu
++    // past where you wanted it. Restored on the way out.
++    saved_repeat_ = get_switches_repeat_config();
++    if (!cfg_.key_repeat) set_switches_repeat_config(SwitchesState{});
++
++    router_.set_local_node(cfg_.node_id, DEFAULT_PSK, sizeof(DEFAULT_PSK));
++    // Reading files, deriving the channel table and starting the receiver all happen on
++    // the first timer tick - see start_deferred(): they reach the card or the baseband,
++    // and this constructor may run deep inside the launcher's touch dispatch.
++
++    router_.set_on_packet([this](const MeshPacket& pkt) {
++        // Set our clock from the mesh, once, and only while it is still sitting at the
++        // 1980 the RTC powers up with - never over a time the user set themselves.
++        if (!rtc_is_set()) {
++            uint32_t peer_time = 0;
++            if (pkt.data.portnum == PortNum::POSITION) {
++                if (const NodeEntry* e = node_db_.find(pkt.header.from))
++                    peer_time = e->position.timestamp;
++            } else if (pkt.data.portnum == PortNum::TELEMETRY) {
++                peer_time = node_db_.last_telemetry().timestamp;
++            }
++            if (peer_time > 1704067200u && peer_time < 4102444800u) {
++                rtc::RTC t;
++                unix_to_rtc(peer_time, t);
++                rtc_time::set(t);
++            }
++        }
++        chat_view_.on_packet(pkt);
++        nodes_view_.refresh();
++    });
++
++    chat_view_.set_gains(cfg_.rx_lna, cfg_.rx_vga, cfg_.rx_amp);
++    chat_view_.set_on_gain([this](uint8_t lna, uint8_t vga, uint8_t amp) {
++        cfg_.rx_lna = lna;
++        cfg_.rx_vga = vga;
++        cfg_.rx_amp = amp;
++        settings_.save();
++    });
++    chat_view_.set_on_channels([this]() { cycle_channel(); });
++    chat_view_.set_beep_flag(&cfg_.beep_on_rx);
++    chat_view_.set_display(cfg_.chat);
++    own_.me = 0;
++    for (char c : cfg_.my_node) {
++        const int v = hex_digit(c);
++        if (v < 0) {
++            own_.me = 0;
++            break;
++        }
++        own_.me = (own_.me << 4) | static_cast<uint32_t>(v);
++    }
++    nodes_view_.set_own(&own_, [this](uint32_t id) {
++        own_.me = id;
++        cfg_.my_node = to_string_hex(id, 8);
++        settings_.save();
++    });
++}
++
++MeshtasticView::~MeshtasticView() {
++    // The nodes still in memory go to the card too, so the All list survives a restart.
++    {
++        const uint32_t unix_now = now_unix();
++        for (size_t i = 0; i < node_db_.count(); i++) {
++            const NodeEntry* e = node_db_.at(i);
++            if (e && e->active && e->node_id) seen_put(NodeDB::make_record(*e, unix_now, uptime_ticks_));
++        }
++    }
++    save_known_nodes();
++    set_switches_repeat_config(saved_repeat_);  // hand the keys back as we found them
++    audio::output::stop();
++    // Clear the models' enabled_ flags (not just radio::disable()): they are global
++    // singletons that outlive this view; a stale flag made the next launch message a
++    // shut-down M4 before run_image() - an infinite send_message() spin.
++    receiver_model.disable();
++    transmitter_model.disable();
++    baseband::shutdown();
++    // Let the M4 finish its processor teardown before anyone can run_image() again.
++    chThdSleepMilliseconds(50);
++}
++
++void MeshtasticView::focus() {
++    tab_view_.focus();
++}
++
++void MeshtasticView::set_parent_rect(const Rect new_parent_rect) {
++    View::set_parent_rect(new_parent_rect);
++    tab_view_.set_parent_rect({0, 0, new_parent_rect.width(), 3 * 8});
++}
++
++uint8_t MeshtasticView::active_coding_rate() const {
++    const uint8_t cr = cfg_.coding_rate;
++    return (cr >= 5 && cr <= 8) ? cr : meshtastic::MODEM_PRESETS[cfg_.preset_idx].cr;
++}
++
++void MeshtasticView::resend_lora_config() {
++    const auto& preset = MODEM_PRESETS[cfg_.preset_idx];
++    baseband::set_lora_config(preset.sf, preset.bw_hz, active_coding_rate(), cfg_.node_id);
++}
++
++void MeshtasticView::start_deferred() {
++    apply_channels();
++    if (cfg_.logging) {
++        logger_ = std::make_unique<MeshtasticLogger>();
++        logger_->append(u"/LOGS/mesh_rx.csv");
++    }
++    start_rx();
++}
++
++void MeshtasticView::start_rx() {
++    // Clear the enabled flags before the set_*() calls below: while set, each
++    // ReceiverModel::set_*() messages the baseband, and here the M4 image is down.
++    receiver_model.disable();
++    transmitter_model.disable();
++    baseband::shutdown();
++    // shutdown() returns once the M4 consumes the message, not when its teardown ends;
++    // run_image() below hard-resets the M4.
++    chThdSleepMilliseconds(30);
++
 +    const uint32_t freq = (cfg_.freq_override_hz != 0)
 +                              ? cfg_.freq_override_hz
 +                              : static_cast<uint32_t>(channel_frequency(cfg_.region_idx, cfg_.preset_idx, cfg_.freq_slot,
@@ -5661,28 +5845,7 @@ index c6181f9..3af98d3 100644
 +    receiver_model.set_baseband_bandwidth(1'750'000);
 +    receiver_model.set_modulation(ReceiverModel::Mode::WidebandFMAudio);
 +    receiver_model.set_target_frequency(freq);
- 
--size_t MeshtasticView::derive_channel_key(const std::string& text, uint8_t out[32]) {
--    const auto all_hex = [&](size_t n) {
--        if (text.size() != n) return false;
--        for (size_t i = 0; i < n; i++)
--            if (hex_digit(text[i]) < 0) return false;
--        return true;
--    };
--    if (all_hex(64)) {  // exact 64 hex -> raw AES-256 key (stock nodes with a 32 byte PSK)
--        for (int i = 0; i < 32; i++)
--            out[i] = static_cast<uint8_t>((hex_digit(text[2 * i]) << 4) | hex_digit(text[2 * i + 1]));
--        return 32;
--    }
--    if (all_hex(32)) {  // exact 32 hex -> raw AES-128 key
--        for (int i = 0; i < 16; i++)
--            out[i] = static_cast<uint8_t>((hex_digit(text[2 * i]) << 4) | hex_digit(text[2 * i + 1]));
--        return 16;
--    }
--    for (int i = 0; i < 16; i++) out[i] = 0;  // else derive from passphrase
--    if (text.empty()) {
--        out[0] = 1;
--        return 16;
++
 +    baseband::run_image(portapack::spi_flash::image_tag_lora_rx);
 +    receiver_model.enable();
 +    reconfig_delay_ = 6;
@@ -5692,12 +5855,9 @@ index c6181f9..3af98d3 100644
 +        audio::output::start();
 +    } else {
 +        audio::output::stop();
-     }
--    for (size_t i = 0; i < 16; i++)
--        out[i] = static_cast<uint8_t>(text[i % text.size()] ^ (0x9E * (i + 1)));
--    return 16;
- }
- 
++    }
++}
++
  void MeshtasticView::apply_channels() {
 -    // Slot 0 = primary (preset default channel name + well-known PSK).
 -    // The name is whatever the user set, falling back to the preset's. Deriving it from
@@ -5708,7 +5868,7 @@ index c6181f9..3af98d3 100644
      if (cfg_.primary_name.empty()) {
          channel_hash_ = meshtastic::preset_channel_hash(cfg_.preset_idx, DEFAULT_PSK,
                                                          sizeof(DEFAULT_PSK));
-@@ -7132,7 +2247,7 @@ void MeshtasticView::apply_channels() {
+@@ -7132,7 +2427,7 @@ void MeshtasticView::apply_channels() {
                                                   sizeof(DEFAULT_PSK));
      }
      router_.set_channel(0, channel_hash_, DEFAULT_PSK, sizeof(DEFAULT_PSK), true);
@@ -5717,7 +5877,7 @@ index c6181f9..3af98d3 100644
      for (int i = 0; i < MeshSettings::NUM_CUSTOM; i++) {
          const bool on = cfg_.ch_enabled[i] && !cfg_.ch_name[i].empty();
          if (on) {
-@@ -7148,314 +2263,75 @@ void MeshtasticView::apply_channels() {
+@@ -7148,46 +2443,28 @@ void MeshtasticView::apply_channels() {
      if (cfg_.active_channel > MeshSettings::NUM_CUSTOM) cfg_.active_channel = 0;
      if (cfg_.active_channel != 0 &&
          !(cfg_.ch_enabled[cfg_.active_channel - 1] && !cfg_.ch_name[cfg_.active_channel - 1].empty()))
@@ -5755,105 +5915,6 @@ index c6181f9..3af98d3 100644
 -    for (uint8_t i = 0; i < UTIL_BUCKETS; i++) {
 -        rx += util_rx_[i];
 -        tx += util_tx_[i];
--    }
--    const uint32_t span = util_span_ticks_ ? util_span_ticks_ : 1;
--    telemetry_.channel_utilization = 100.0f * static_cast<float>(rx) / static_cast<float>(span);
--    telemetry_.air_util_tx = 100.0f * static_cast<float>(tx) / static_cast<float>(span);
--    telemetry_.has_device = true;
--    map_view_.set_utilisation(telemetry_.channel_utilization, telemetry_.air_util_tx);
--    map_view_.set_uptime(uptime_ticks_ / 60);  // ticks are ~60 Hz; the wire carries seconds
--}
--
--void MeshtasticView::save_known_nodes() {
--    // Every node we can name or hold a key for, not only the ones we have a private
--    // thread with. A peer's public key travels in its NodeInfo and nowhere else, and a
--    // stock node sends that once every few hours - so losing the key on restart meant
--    // being unable to open that peer's encrypted direct messages until it next chose to
--    // introduce itself. Keeping the key is a dozen short lines on the card.
--    // The last field marks a private thread, so the conversations list is restored too.
--    auto f = std::make_unique<File>();
--    if (f->create(u"/LOGS/mesh_dms.txt").is_valid()) return;
--    for (size_t i = 0; i < node_db_.count(); i++) {
--        const NodeEntry* e = node_db_.at(i);
--        if (!e || !e->active) continue;
--        if (!e->has_pubkey && !e->long_name[0] && !e->dm_thread) continue;  // nothing to keep
--        std::string line = to_string_hex(e->node_id, 8) + "," + e->long_name + "," +
--                           e->short_name + ",";
--        if (e->has_pubkey)
--            for (int k = 0; k < 32; k++) line += to_string_hex(e->public_key[k], 2);
--        // Thread flag and the colour the user gave this node. The colour was lost on
--        // every restart, so old chat lines kept the colour saved with them while new
--        // ones from the same node came out plain - "the colours sometimes disappear".
--        line += e->dm_thread ? ",1," : ",0,";
--        line += to_string_dec_uint(e->colour) + "\n";
--        f->write(line.data(), line.size());
--    }
--}
--
--void MeshtasticView::load_known_nodes() {
--    auto f = std::make_unique<File>();
--    if (f->open(u"/LOGS/mesh_dms.txt").is_valid()) return;
--    const size_t size = f->size();
--    if (!size || size > 4096) return;
--    std::string buf(size, '\0');
--    const auto rd = f->read(&buf[0], size);
--    if (!rd) return;
--    buf.resize(*rd);
--
--    size_t pos = 0;
--    while (pos < buf.size()) {
--        const size_t eol = buf.find('\n', pos);
--        const std::string line = buf.substr(pos, (eol == std::string::npos) ? std::string::npos
--                                                                            : eol - pos);
--        pos = (eol == std::string::npos) ? buf.size() : eol + 1;
--        // id,long,short,pubkey-hex - the last field is empty for a node we have no key for.
--        const size_t c1 = line.find(','), c2 = line.find(',', c1 + 1),
--                     c3 = line.find(',', c2 + 1);
--        if (c1 == std::string::npos || c2 == std::string::npos || c3 == std::string::npos)
--            continue;
--        uint32_t id = 0;
--        for (size_t k = 0; k < c1; k++) {
--            const int v = hex_digit(line[k]);
--            if (v < 0) {
--                id = 0;
--                break;
--            }
--            id = (id << 4) | static_cast<uint32_t>(v);
--        }
--        if (!id) continue;
--        const std::string ln = line.substr(c1 + 1, c2 - c1 - 1);
--        const std::string sn = line.substr(c2 + 1, c3 - c2 - 1);
--        node_db_.update_node(id, ln.empty() ? nullptr : ln.c_str(),
--                             sn.empty() ? nullptr : sn.c_str());
--        // id,long,short,pubkey-hex[,dm]. Files written before the dm flag existed have
--        // four fields and every line in them was a thread, which is what the default says.
--        const size_t c4 = line.find(',', c3 + 1);
--        const std::string key = line.substr(c3 + 1, (c4 == std::string::npos)
--                                                        ? std::string::npos
--                                                        : c4 - c3 - 1);
--        const bool is_thread = (c4 == std::string::npos) || (line[c4 + 1] != '0');
--        // ...and the colour after it, if this file is new enough to carry one.
--        const size_t c5 = (c4 == std::string::npos) ? std::string::npos
--                                                    : line.find(',', c4 + 1);
--        uint8_t colour = 0;
--        if (c5 != std::string::npos && c5 + 1 < line.size())
--            colour = static_cast<uint8_t>(atoi(line.c_str() + c5 + 1) & 7);
--        if (key.size() >= 64) {
--            uint8_t pub[32];
--            bool ok = true;
--            for (int k = 0; k < 32 && ok; k++) {
--                const int hi = hex_digit(key[2 * k]), lo = hex_digit(key[2 * k + 1]);
--                if (hi < 0 || lo < 0)
--                    ok = false;
--                else
--                    pub[k] = static_cast<uint8_t>((hi << 4) | lo);
--            }
--            if (ok) node_db_.set_pubkey(id, pub);
--        }
--        if (is_thread) node_db_.mark_dm(id);
--        if (colour) {
--            NodeEntry* n = node_db_.find(id);
--            if (n) n->colour = colour;
 +    const uint8_t a = cfg_.active_channel;
 +    const std::string& nm = (a == 0) ? cfg_.primary_name : cfg_.ch_name[a - 1];
 +    chat_view_.set_channel_label(nm.empty() ? std::string("Ch:") + to_string_dec_uint(a)
@@ -5870,10 +5931,21 @@ index c6181f9..3af98d3 100644
 +        if (c == 0 || (cfg_.ch_enabled[c - 1] && !cfg_.ch_name[c - 1].empty())) {
 +            cfg_.active_channel = static_cast<uint8_t>(c);
 +            break;
-         }
++        }
      }
+-    const uint32_t span = util_span_ticks_ ? util_span_ticks_ : 1;
+-    telemetry_.channel_utilization = 100.0f * static_cast<float>(rx) / static_cast<float>(span);
+-    telemetry_.air_util_tx = 100.0f * static_cast<float>(tx) / static_cast<float>(span);
+-    telemetry_.has_device = true;
+-    map_view_.set_utilisation(telemetry_.channel_utilization, telemetry_.air_util_tx);
+-    map_view_.set_uptime(uptime_ticks_ / 60);  // ticks are ~60 Hz; the wire carries seconds
 +    apply_channels();
 +    settings_.save();
+ }
+ 
+ void MeshtasticView::save_known_nodes() {
+@@ -7284,178 +2561,74 @@ void MeshtasticView::load_known_nodes() {
+     }
  }
  
 -void MeshtasticView::pack_extras() {
@@ -5885,8 +5957,14 @@ index c6181f9..3af98d3 100644
 -        const uint16_t v = cfg_.telemetry.extra_raw[k];
 -        for (int sh = 12; sh >= 0; sh -= 4) cfg_.extra_pack += HEX[(v >> sh) & 0xF];
 -    }
--}
--
++void MeshtasticView::on_gps(const GPSPosDataMessage* msg) {
++    if (!msg) return;
++    if ((msg->lat == 0.0f && msg->lon == 0.0f) || msg->lat < -90.0f || msg->lat > 90.0f || msg->lon < -180.0f || msg->lon > 180.0f) return;
++    own_.gps = true;
++    own_.lat = msg->lat;
++    own_.lon = msg->lon;
+ }
+ 
 -void MeshtasticView::unpack_extras() {
 -    for (size_t k = 0; k < NUM_EXTRA_METRICS; k++) {
 -        const size_t at = k * 5;
@@ -5983,6 +6061,7 @@ index c6181f9..3af98d3 100644
 +    uptime_ticks_++;
 +    nodes_view_.set_now(uptime_ticks_);  // live "last heard" ages
 +    chat_view_.set_now(uptime_ticks_);
++    if (g_finder) g_finder->tick(uptime_ticks_);
 +    if ((uptime_ticks_ % 60u) == 0) {
 +        // Date evictions and park the nodes the table pushed out on the SD card.
 +        node_db_.set_clock(now_unix(), uptime_ticks_);
@@ -6000,12 +6079,15 @@ index c6181f9..3af98d3 100644
 -    rand_state_ = x ? x : 0x1u;
 -    return rand_state_;
 -}
--
++    router_.set_crc_policy(cfg_.crc_policy);
++    router_.set_ignore_mqtt(cfg_.ignore_mqtt);
+ 
 -void MeshtasticView::randomize_identity() {
 -    // Fold in the RTC so successive boots pick different identities.
 -    rand_state_ ^= (static_cast<uint32_t>(rtc_time::now().second()) + 1u) * 0x9e3779b9u;
-+    router_.set_crc_policy(cfg_.crc_policy);
-+    router_.set_ignore_mqtt(cfg_.ignore_mqtt);
++    // Hold the backlight timeout off: a passive receiver never gets touched and the
++    // screen would blank mid-reception (but a screen already off stays off).
++    portapack::bl_tick_counter = 0;
  
 -    if (cfg_.rand_mask & MeshSettings::RAND_ID) {
 -        cfg_.node_id = rand_next();
@@ -6034,10 +6116,14 @@ index c6181f9..3af98d3 100644
 -        static const uint8_t roles[] = {0, 1, 5, 6, 8};  // client, mute, tracker, sensor, hidden
 -        cfg_.node_role = roles[rand_next() % (sizeof(roles) / sizeof(roles[0]))];
 -        router_.set_role(cfg_.node_role);
--    }
-+    // Hold the backlight timeout off: a passive receiver never gets touched and the
-+    // screen would blank mid-reception (but a screen already off stays off).
-+    portapack::bl_tick_counter = 0;
++    // First tick after construction: everything that touches the card or the baseband,
++    // away from the deep stack of the constructor.
++    if (!deferred_load_) {
++        deferred_load_ = true;
++        start_deferred();
++        chat_view_.load_deferred();
++        load_known_nodes();
+     }
  
 -    if (cfg_.rand_mask & MeshSettings::RAND_POS) {
 -        // Move the broadcast position, keeping it plausible rather than teleporting
@@ -6050,7 +6136,13 @@ index c6181f9..3af98d3 100644
 -        if (base_lat == 0.0f && base_lon == 0.0f) {  // never set: pick something real
 -            base_lat = 55.0f;
 -            base_lon = 37.0f;
--        }
++    // Names arrive a few times a day: keep them on the card whenever the number of named nodes changes.
++    if ((uptime_ticks_ % 600u) == 0) {
++        uint16_t sig = 0;
++        for (size_t i = 0; i < node_db_.count(); i++) {
++            const NodeEntry* e = node_db_.at(i);
++            if (e && e->active && e->long_name[0]) sig = static_cast<uint16_t>(sig * 31u + (e->node_id & 0xFFFFu) + 1u);
+         }
 -        cfg_.fixed_lat = base_lat + jitter();
 -        cfg_.fixed_lon = base_lon + jitter();
 -        cfg_.gps_enabled = false;
@@ -6069,13 +6161,10 @@ index c6181f9..3af98d3 100644
 -            const uint16_t cap = EXTRA_METRICS[k].rnd_max ? EXTRA_METRICS[k].rnd_max : 100;
 -            cfg_.telemetry.extra_raw[k] = static_cast<uint16_t>(rand_next() % (cap + 1u));
 -            cfg_.telemetry.extra_on[k] = 1;
--        }
-+    // First tick after construction: everything that touches the card or the baseband,
-+    // away from the deep stack of the constructor.
-+    if (!deferred_load_) {
-+        deferred_load_ = true;
-+        start_deferred();
-+        chat_view_.load_deferred();
++        if (sig != names_sig_) {
++            names_sig_ = sig;
++            save_known_nodes();
+         }
      }
  
 -    nodeinfo_timer_ = nodeinfo_period() - 60;  // announce the new identity within ~1 s
@@ -6086,10 +6175,18 @@ index c6181f9..3af98d3 100644
  
  }  // namespace ui
 diff --git a/firmware/application/apps/ui_meshtastic.hpp b/firmware/application/apps/ui_meshtastic.hpp
-index 695c7b4..f64bc29 100644
+index 695c7b4..eaa8261 100644
 --- a/firmware/application/apps/ui_meshtastic.hpp
 +++ b/firmware/application/apps/ui_meshtastic.hpp
-@@ -592,185 +592,6 @@ struct MeshSettingsHooks {
+@@ -508,6 +508,7 @@ struct MeshSettings {
+                               ECHO_BELL = 32 };
+     uint8_t echo_mask{ECHO_TEXT | ECHO_SIG};
+     std::string echo_key{};
++    std::string my_node{};  // hex id of the node the user carries: its position is "where I am"
+     bool mqtt_ok{false};
+     // HardwareModel advertised in NodeInfo. 255 = PRIVATE_HW; pick a common node
+     // (Heltec V3, T-Beam, ...) so peers show us as that device.
+@@ -592,185 +593,6 @@ struct MeshSettingsHooks {
  // SD card into RAM (the SPI flash is full, so the glyphs can't be baked in), and known
  // emoji as short ASCII tokens (->"+1"); anything else -> a "." placeholder. Entirely
  // self-contained to this app - no shared font/UI/baseband changes.
@@ -6275,7 +6372,7 @@ index 695c7b4..f64bc29 100644
  class MeshConsole : public Widget {
     public:
      explicit MeshConsole(Rect parent_rect);
-@@ -926,49 +747,27 @@ class MeshConsole : public Widget {
+@@ -926,49 +748,27 @@ class MeshConsole : public Widget {
  
  class MeshtasticChatView : public View {
     public:
@@ -6330,7 +6427,7 @@ index 695c7b4..f64bc29 100644
      void set_last_signal(int8_t rssi, int16_t snr_tenths) {
          if (!rssi && !snr_tenths) return;
          text_rssi_.set(to_string_dec_int(rssi) + "/" +
-@@ -982,74 +781,40 @@ class MeshtasticChatView : public View {
+@@ -982,74 +782,40 @@ class MeshtasticChatView : public View {
          else
              console_.write(s);
      }
@@ -6411,7 +6508,7 @@ index 695c7b4..f64bc29 100644
      static constexpr uint32_t KEYBOARD_BYTES = 4848;
      uint8_t* ext_font_{nullptr};
      bool ext_font_short_{false};  // a table was there, but loading it would have hurt
-@@ -1057,10 +822,10 @@ class MeshtasticChatView : public View {
+@@ -1057,10 +823,10 @@ class MeshtasticChatView : public View {
  
      static constexpr int SV_H = 280;
      static constexpr int STATUS_H = 16;
@@ -6425,7 +6522,7 @@ index 695c7b4..f64bc29 100644
  
      NavigationView& nav_;
      meshtastic::MeshRouter& router_;
-@@ -1068,61 +833,26 @@ class MeshtasticChatView : public View {
+@@ -1068,61 +834,26 @@ class MeshtasticChatView : public View {
  
      std::vector<ChatMessage> messages_{};
      static constexpr size_t MAX_MESSAGES = 16;
@@ -6436,12 +6533,12 @@ index 695c7b4..f64bc29 100644
      uint32_t now_ticks_{0};
 -    // No ACK within this many ~60 Hz ticks -> mark the message failed (red).
 -    static constexpr uint32_t ACK_TIMEOUT_TICKS = 30 * 60;  // ~30 s
--
+ 
 -    // Default to broadcast - the dest button starts labelled ">All", so dest_id_
 -    // must match (was 0, which sent dest=0x00000000 that real Meshtastic drops).
 -    uint32_t dest_id_{meshtastic::BROADCAST_ADDR};
 -    uint8_t dest_node_idx_{0};
- 
+-
 -    // Caption the destination button for the current dest_id_ (">All" or ">peer").
 -    void apply_dest_label();
 -
@@ -6492,7 +6589,7 @@ index 695c7b4..f64bc29 100644
      void switch_conversation();
  
      Labels labels_rf_{
-@@ -1132,185 +862,22 @@ class MeshtasticChatView : public View {
+@@ -1132,185 +863,22 @@ class MeshtasticChatView : public View {
      NumberField field_lna_{{2 * 8, 0}, 2, {0, 40}, 8, ' '};
      NumberField field_vga_{{6 * 8, 0}, 2, {0, 62}, 2, ' '};
      NumberField field_amp_{{10 * 8, 0}, 1, {0, 1}, 1, ' '};
@@ -6528,8 +6625,12 @@ index 695c7b4..f64bc29 100644
 -    // Cycles the console filter: everything / messages only / status lines only.
 -    Button button_filter_{{176, BOT_Y, 38, BOT_H}, "All"};
 -    Button button_clear_{{214, BOT_Y, 26, BOT_H}, "X"};
--};
--
++    // Receive-only: channel button (wide), filter, clear.
++    Button button_chan_{{0, BOT_Y, 150, BOT_H}, "Ch:0"};
++    Button button_filter_{{150, BOT_Y, 50, BOT_H}, "All"};
++    Button button_clear_{{200, BOT_Y, 40, BOT_H}, "X"};
+ };
+ 
 -// ---- Message detail (full-screen, pushed by tapping a chat line) -----------
 -// Everything known about one message plus a resend, which is the quickest way to
 -// retry a direct message that timed out without retyping it.
@@ -6577,12 +6678,8 @@ index 695c7b4..f64bc29 100644
 -    REQ_METRICS = 0,  // Telemetry, device variant: battery, voltage, airtime
 -    REQ_STATS = 1,    // Telemetry, LocalStats variant: the router's own counters
 -    REQ_TRACE = 2,    // RouteDiscovery: which path reaches this node
-+    // Receive-only: channel button (wide), filter, clear.
-+    Button button_chan_{{0, BOT_Y, 150, BOT_H}, "Ch:0"};
-+    Button button_filter_{{150, BOT_Y, 50, BOT_H}, "All"};
-+    Button button_clear_{{200, BOT_Y, 40, BOT_H}, "X"};
- };
- 
+-};
+-
 -class MeshtasticNodeDetailView : public View {
 -   public:
 -    MeshtasticNodeDetailView(NavigationView& nav,
@@ -6685,7 +6782,53 @@ index 695c7b4..f64bc29 100644
  class MeshtasticSeenView : public View {
     public:
      MeshtasticSeenView(NavigationView& nav, meshtastic::NodeDB& node_db, uint32_t now_ticks);
-@@ -1365,13 +932,6 @@ class MeshtasticNodesView : public View {
+@@ -1350,6 +918,45 @@ class MeshtasticSeenView : public View {
+     void scroll_by(int delta);
+ };
+ 
++// ---- Find: signal history, trend, bearing and distance of one node ---------------------------------------
++
++// Opened from the node list. Every packet the node sends adds a sample; "warmer / colder" compares the newest few with the
++// ones before, so walking towards the node makes the word turn green. When the node has told us its position and our own
++// point is set in the ini (fix_lat / fix_lon) the bearing and distance are exact; otherwise they are not shown.
++// Where "I" am: a live GPS fix if the PortaPack has one, otherwise the latest position of the node the user carries
++// (set with the Me button in the Find screen, kept as mynode= in the ini). Never a fixed coordinate.
++struct MeshOwn {
++    bool gps{false};
++    float lat{0.0f}, lon{0.0f};
++    uint32_t me{0};
++};
++
++class MeshtasticFinderView : public View {
++   public:
++    MeshtasticFinderView(NavigationView& nav, meshtastic::NodeDB& node_db, uint32_t node_id, MeshOwn& own, std::function<void(uint32_t)> on_set_me);
++    ~MeshtasticFinderView();
++    void focus() override { button_close_.focus(); }
++    void paint(Painter& painter) override;
++    std::string title() const override { return "Find"; }
++    void tick(uint32_t now_ticks);
++
++   private:
++    static constexpr int NS = 48;  // samples kept
++    NavigationView& nav_;
++    meshtastic::NodeDB& node_db_;
++    uint32_t node_id_;
++    MeshOwn& own_;
++    std::function<void(uint32_t)> on_set_me_;
++    uint32_t last_seen_{0};
++    uint32_t now_ticks_{0};
++    int8_t snr2_[NS]{};   // SNR in half-dB steps
++    int8_t rssi_[NS]{};
++    uint8_t n_{0};        // samples stored (newest last)
++    void push_sample(int8_t rssi, int8_t snr2);
++    Button button_close_{{0, 272, 160, 32}, "Close"};
++    Button button_me_{{160, 272, 80, 32}, "Me"};
++};
++
+ // ---- Tab: Nodes  (index 1) -------------------------------------------------
+ 
+ class MeshtasticNodesView : public View {
+@@ -1365,13 +972,10 @@ class MeshtasticNodesView : public View {
      bool on_key(const KeyEvent key) override;
      bool on_touch(const TouchEvent event) override;
      void refresh();
@@ -6696,10 +6839,20 @@ index 695c7b4..f64bc29 100644
 -    // Wired by the owner: announce ourselves and ask the mesh to answer, so peers'
 -    // public keys arrive. Handed on to the node card, which is where the button is.
 -    void set_on_exchange(std::function<void()> cb) { on_exchange_ = std::move(cb); }
++    void set_own(MeshOwn* own, std::function<void(uint32_t)> cb) {
++        own_ = own;
++        on_set_me_ = std::move(cb);
++    }
      // Current uptime (ticks) for "last heard" ages; repaints ~1/s while shown.
      void set_now(uint32_t ticks) {
          if (!hidden() && ticks >= now_ticks_ + 60) set_dirty();
-@@ -1401,9 +961,6 @@ class MeshtasticNodesView : public View {
+@@ -1397,13 +1001,12 @@ class MeshtasticNodesView : public View {
+     NavigationView& nav_;
+     meshtastic::NodeDB& node_db_;
+ 
++    MeshOwn* own_{nullptr};
++    std::function<void(uint32_t)> on_set_me_{};
+     size_t selected_{0};
      size_t scroll_offset_{0};
      uint32_t now_ticks_{0};
      uint32_t last_refresh_tick_{0};  // throttles RX-driven repaints
@@ -6709,7 +6862,7 @@ index 695c7b4..f64bc29 100644
      // Newest first by default: a node that just appeared is the interesting one.
      Sort sort_{Sort::Age};
      bool sort_desc_{true};
-@@ -1434,678 +991,7 @@ class MeshtasticNodesView : public View {
+@@ -1434,963 +1037,73 @@ class MeshtasticNodesView : public View {
      // at best - so the button now carries it, and says which way round it is.
      Button button_sort_{{60, BOT_Y, 57, BOT_H}, "Age v"};
      // Every node heard, including the ones the table had no room for (see MeshtasticSeenView).
@@ -7389,7 +7542,11 @@ index 695c7b4..f64bc29 100644
  };
  
  // ============================================================================
-@@ -2115,282 +1001,56 @@ class MeshtasticChannelsView : public View {
+ // Main Meshtastic app view
+ // ============================================================================
+ 
++extern MeshtasticFinderView* g_finder;
++
  class MeshtasticView : public View {
     public:
      explicit MeshtasticView(NavigationView& nav);
@@ -7427,6 +7584,11 @@ index 695c7b4..f64bc29 100644
 -
 +    void apply_channels();  // push the channel table (hashes + keys) to the router
 +    void cycle_channel();   // the "Ch" button: next enabled channel
++    void save_known_nodes();
++    void load_known_nodes();
++    void on_gps(const GPSPosDataMessage* msg);
++    MeshOwn own_{};
++    uint16_t names_sig_{0};
      void on_timer();
 -    // Console lines built out of line, so their string temporaries do not sit in the
 -    // receive handler's frame. See the note on the definitions.
@@ -7682,7 +7844,7 @@ index 695c7b4..f64bc29 100644
  
      MessageHandlerRegistration handler_lora_{
          Message::ID::LoRaPacket,
-@@ -2398,35 +1058,6 @@ class MeshtasticView : public View {
+@@ -2398,33 +1111,10 @@ class MeshtasticView : public View {
              on_lora_packet(static_cast<const LoRaPacketMessage*>(p));
          }};
  
@@ -7692,9 +7854,9 @@ index 695c7b4..f64bc29 100644
 -            on_lora_rx_status(static_cast<const LoRaRxStatusMessage*>(p));
 -        }};
 -
--    MessageHandlerRegistration handler_gps_{
--        Message::ID::GPSPosData,
--        [this](const Message* const p) {
+     MessageHandlerRegistration handler_gps_{
+         Message::ID::GPSPosData,
+         [this](const Message* const p) {
 -            on_gps_update(static_cast<const GPSPosDataMessage*>(p));
 -        }};
 -
@@ -7713,11 +7875,10 @@ index 695c7b4..f64bc29 100644
 -        [this](const Message* const p) {
 -            const auto& msg = *reinterpret_cast<const TXProgressMessage*>(p);
 -            if (msg.done) on_tx_done(msg.progress);
--        }};
--
++            on_gps(static_cast<const GPSPosDataMessage*>(p));
+         }};
+ 
      MessageHandlerRegistration handler_frame_{
-         Message::ID::DisplayFrameSync,
-         [this](const Message* const) { on_timer(); }};
 diff --git a/firmware/application/ui_navigation.cpp b/firmware/application/ui_navigation.cpp
 index 1f025a5..178a2f1 100644
 --- a/firmware/application/ui_navigation.cpp
@@ -7732,7 +7893,7 @@ index 1f025a5..178a2f1 100644
      {"radiosonde", "Radiosnde", RX, Color::green(), &bitmap_icon_sonde, new ViewFactory<SondeView>()},
      {"search", "Search", RX, Color::yellow(), &bitmap_icon_search, new ViewFactory<SearchView>()},
 diff --git a/firmware/baseband/CMakeLists.txt b/firmware/baseband/CMakeLists.txt
-index d3ced31..9e85bf2 100644
+index d3ced31..63b517e 100644
 --- a/firmware/baseband/CMakeLists.txt
 +++ b/firmware/baseband/CMakeLists.txt
 @@ -364,6 +364,8 @@ set(MODE_FLAGS "-O3")
@@ -7744,17 +7905,7 @@ index d3ced31..9e85bf2 100644
  DeclareTargets(PADR adsbrx)
  
  
-@@ -374,9 +376,7 @@ set(MODE_CPPSRC
- # Moved to the SD card: the SPI flash cannot hold this and the Meshtastic
- # basebands at once. m4_init_from_sd() loads /BASEBAND/<TAG>.img on demand, so
- # copy the matching .img from build/firmware/baseband/ to the card.
--set(add_to_firmware FALSE)
- DeclareTargets(PAFT afsktx)
--set(add_to_firmware TRUE)
- 
- ### APRS RX
- 
-@@ -426,7 +426,10 @@ set(MODE_FLAGS "-Os")
+@@ -426,7 +428,10 @@ set(MODE_FLAGS "-Os")
  set(MODE_CPPSRC
  	proc_lora_tx.cpp
  )
@@ -7765,7 +7916,7 @@ index d3ced31..9e85bf2 100644
  set(MODE_FLAGS "-O3")
  
  ### AIS
-@@ -459,12 +462,8 @@ DeclareTargets(PCAP capture)
+@@ -459,12 +464,8 @@ DeclareTargets(PCAP capture)
  set(MODE_CPPSRC
  	proc_sonde.cpp
  )
@@ -7779,16 +7930,19 @@ index d3ced31..9e85bf2 100644
  
  ### FSK RX
  
-@@ -478,6 +477,8 @@ DeclareTargets(PFSR fskrx)
+@@ -478,7 +479,11 @@ DeclareTargets(PFSR fskrx)
  set(MODE_CPPSRC
  	proc_fsk.cpp
  )
 +# On the SD card: small enough (7-9 kB) to load from /BASEBAND/PFSK.img on demand without trouble; this frees flash for the
 +# larger basebands that cannot be loaded from the card reliably.
++set(add_to_firmware FALSE)
  DeclareTargets(PFSK fsktx)
++set(add_to_firmware TRUE)
  
  set(MODE_CPPSRC
-@@ -486,9 +487,7 @@ set(MODE_CPPSRC
+ 	proc_mictx.cpp
+@@ -486,9 +491,7 @@ set(MODE_CPPSRC
  # Moved to the SD card: the SPI flash cannot hold this and the Meshtastic
  # basebands at once. m4_init_from_sd() loads /BASEBAND/<TAG>.img on demand, so
  # copy the matching .img from build/firmware/baseband/ to the card.
@@ -7798,7 +7952,7 @@ index d3ced31..9e85bf2 100644
  
  ### NFM Audio
  
-@@ -502,6 +501,8 @@ DeclareTargets(PNFM nfm_audio)
+@@ -502,6 +505,8 @@ DeclareTargets(PNFM nfm_audio)
  set(MODE_CPPSRC
  	proc_ook.cpp
  )
@@ -7807,7 +7961,7 @@ index d3ced31..9e85bf2 100644
  DeclareTargets(POOK ook)
  
  
-@@ -527,23 +528,17 @@ set(add_to_firmware TRUE)
+@@ -527,23 +532,17 @@ set(add_to_firmware TRUE)
  set(MODE_CPPSRC
  	proc_replay.cpp
  )
@@ -7835,7 +7989,7 @@ index d3ced31..9e85bf2 100644
  
  
  ### WFM Audio
-@@ -561,9 +556,7 @@ set(MODE_CPPSRC
+@@ -561,9 +560,7 @@ set(MODE_CPPSRC
  # Moved to the SD card: the SPI flash cannot hold this and the Meshtastic
  # basebands at once. m4_init_from_sd() loads /BASEBAND/<TAG>.img on demand, so
  # copy the matching .img from build/firmware/baseband/ to the card.
@@ -7845,7 +7999,7 @@ index d3ced31..9e85bf2 100644
  
  
  ### Weather Stations
-@@ -573,9 +566,7 @@ set(MODE_CPPSRC
+@@ -573,9 +570,7 @@ set(MODE_CPPSRC
  # Moved to the SD card: the SPI flash cannot hold this and the Meshtastic
  # basebands at once. m4_init_from_sd() loads /BASEBAND/<TAG>.img on demand, so
  # copy the matching .img from build/firmware/baseband/ to the card.

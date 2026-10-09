@@ -19,6 +19,10 @@ Mayhem apps keep working next to it.
   Shows `name: text`, time, a colour stripe per node, a padlock for private channels. Damaged frames are shown marked.
 - **Nodes**: the 14 freshest nodes with name, signal and age; sortable. **All heard** lists every node ever seen (kept on the
   card in `/LOGS/mesh_seen.bin`, up to 256).
+- **Find** (tap or Select on a node): the node's SNR / RSSI, a bar graph of its last 48 packets, a CLOSE / FAR word and a
+  WARMER / COLDER trend while you walk. With a position for both ends it also shows the exact distance and a north-up
+  arrow. "Where I am" is **never a fixed coordinate**: it is a live GPS fix if the PortaPack has one, otherwise the latest
+  position of the node you carry (open that node and press **Me**; saved as `mynode=` in the ini).
 - **Channels with 128- and 256-bit keys** (stock PR #3306 takes only 128-bit).
 - **Cyrillic and other alphabets** from glyph tables on the card (`APPS/mesh_font*.fnt`, `c_glyph=1`).
 - Settings live in `/SETTINGS/meshtastic.ini` (no settings screens). Optional `log=1` writes every received frame to
@@ -29,7 +33,7 @@ Mayhem apps keep working next to it.
 1. Back up your SD card (`FIRMWARE`, `APPS`, `BASEBAND`, `SETTINGS`).
 2. Unpack the release into the **root of the SD card** (merge with the existing folders). `FIRMWARE`, `APPS` and `BASEBAND`
    must all come from the same build: apps with another version hash are greyed out, and a missing baseband shows `NoImg`.
-3. **Utilities → Flash Utility →** `portapack-mayhem_mesh-reader-1.bin`.
+3. **Utilities → Flash Utility →** `portapack-mayhem_mesh-reader-2.bin`.
 4. Edit `/SETTINGS/meshtastic.ini`: `region`, `preset`, `fslot` must match your network, and add your channels
    (`c1_name`, `c1_key` as 32 or 64 hex digits, `c1_en=1`, …). `tools/mesh_channels_to_ini.py` copies them from a node over USB:
 
@@ -50,7 +54,7 @@ with LNA 16-24 and VGA 16-24 (the `L:` `V:` fields in the Chat status row, or `r
 ## Limits
 
 - Nothing is ever sent, so a node does not see you and you cannot reply or request data.
-- Four baseband images (APRS RX, AIS, BLE TX, RDS) are loaded from the SD card to make room in flash; they need a free
+- Six baseband images (APRS RX, AIS, BLE TX, RDS, AFSK TX, FSK TX) are loaded from the SD card to make room in flash; they need a free
   contiguous block of memory and may report `NoImg` if you opened many apps first. Restart and open them first.
 - Flash is full: adding code requires removing something.
 
@@ -60,7 +64,7 @@ with LNA 16-24 and VGA 16-24 (the `L:` `V:` fields in the Chat status row, or `r
 scripts/build.sh   # needs Docker; fetches PR #3306 at the tested commit 51135ec, applies patches/, builds
 ```
 
-Output: `dist/mesh-reader-1/{FIRMWARE,APPS,BASEBAND}`. The full-featured variant with sending lives in
+Output: `dist/mesh-reader-2/{FIRMWARE,APPS,BASEBAND}`. The full-featured variant with sending lives in
 [portapack-mesh](https://github.com/osahv/portapack-mesh).
 
 ## Credits and license
