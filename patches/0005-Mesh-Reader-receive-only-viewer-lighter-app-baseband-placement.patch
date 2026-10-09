@@ -57,7 +57,7 @@ index f3bd55e..e267655 100644
      // neither its name nor its public key. Ask. It is the same request the phone app
      // calls "exchange user info", and it is what fills the node list with names.
 diff --git a/firmware/application/apps/ui_meshtastic.cpp b/firmware/application/apps/ui_meshtastic.cpp
-index c6181f9..bd371dc 100644
+index c6181f9..1dad4a9 100644
 --- a/firmware/application/apps/ui_meshtastic.cpp
 +++ b/firmware/application/apps/ui_meshtastic.cpp
 @@ -6,7 +6,6 @@
@@ -1924,7 +1924,7 @@ index c6181f9..bd371dc 100644
  }
  
  bool MeshtasticNodesView::on_encoder(const EncoderEvent delta) {
-@@ -3448,6 +1773,292 @@ void MeshtasticNodesView::refresh() {
+@@ -3448,6 +1773,316 @@ void MeshtasticNodesView::refresh() {
      set_dirty();
  }
  
@@ -2132,6 +2132,7 @@ index c6181f9..bd371dc 100644
 +    const char* word = snr >= 8 ? "VERY CLOSE" : snr >= 3 ? "CLOSE" : snr >= -3 ? "MEDIUM" : snr >= -10 ? "FAR" : "VERY FAR";
 +    // Trend: newest three samples against the three before them.
 +    const char* trend = "";
++    Color trend_col = st.foreground;
 +    if (n_ >= 6) {
 +        int a = 0, b = 0;
 +        for (int i = 0; i < 3; i++) {
@@ -2139,10 +2140,9 @@ index c6181f9..bd371dc 100644
 +            b += snr2_[n_ - 4 - i];
 +        }
 +        const int d = (a - b) / 3;  // half-dB
-+        trend = d >= 2 ? "  WARMER" : d <= -2 ? "  COLDER" : "  same";
++        trend = d >= 2 ? "WARMER" : d <= -2 ? "COLDER" : "steady";
++        trend_col = d >= 2 ? Color::green() : d <= -2 ? Color::red() : st.foreground;
 +    }
-+    painter.draw_string({x0, y0 + 64}, Theme::getInstance()->fg_yellow ? *Theme::getInstance()->fg_yellow : st, word);
-+    painter.draw_string({x0 + 8 * 11, y0 + 64}, st, trend);
 +
 +    // Where I am: live GPS, else the latest position of the node I carry (never the node being looked for).
 +    float own_lat = 0.0f, own_lon = 0.0f;
@@ -2177,21 +2177,45 @@ index c6181f9..bd371dc 100644
 +        if (dist < 5.0f) dist = 5.0f;
 +        if (dist > 20000.0f) dist = 20000.0f;
 +    }
++    // Signal scale: eight rising steps like a phone's, filled by SNR (-20..+10 dB), one colour per level.
 +    {
++        int k = static_cast<int>((snr + 20.0f) * 8.0f / 30.0f + 0.5f);
++        k = k < 0 ? 0 : k > 8 ? 8 : k;
++        const Color fc = k <= 2 ? Color::red() : k <= 5 ? Color::yellow() : Color::green();
++        const int bx = x0 + 4, base = y0 + 108;
++        for (int i = 0; i < 8; i++)
++            painter.fill_rectangle({bx + i * 13, base - (8 + i * 4), 10, 8 + i * 4}, i < k ? fc : Color::dark_grey());
++
++        // Next to it: how close, which way it is going, how far.
++        const int cx = x0 + 120;
++        const Style word_st{st.font, bg, fc};
++        painter.draw_string({cx, y0 + 68}, word_st, word);
++        const Style trend_st{st.font, bg, trend_col};
++        painter.draw_string({cx, y0 + 84}, trend_st, trend);
 +        const std::string d = dist >= 1000.0f ? to_string_decimal(dist / 1000.0f, 1) + " km"
 +                                              : to_string_dec_uint(static_cast<uint32_t>(dist < 100.0f ? dist : (dist / 10.0f) * 10.0f)) + " m";
-+        painter.draw_string({x0, y0 + 80}, st, exact ? "distance " + d : "~" + d + " by signal");
++        painter.draw_string({cx, y0 + 100}, st, exact ? d : "~" + d);
 +    }
 +
-+    // SNR history: one bar per packet, -20..+12 dB mapped to 0..60 px, newest on the right.
-+    const int gy = y0 + 164;
-+    painter.draw_hline({x0, gy}, screen_width, st.foreground);
-+    for (int i = 0; i < n_; i++) {
-+        int hh = (snr2_[i] + 40) * 60 / 64;
-+        if (hh < 1) hh = 1;
-+        if (hh > 60) hh = 60;
-+        const Color c = snr2_[i] >= 6 ? Color::green() : snr2_[i] >= -6 ? Color::yellow() : Color::red();
-+        painter.fill_rectangle({x0 + i * 5, gy - hh, 4, hh}, c);
++    // History: the last 48 packets as a narrow strip, newest on the right, with the extremes beside it.
++    {
++        const int gx = x0 + 4, gy = y0 + 168;
++        painter.draw_hline({gx, gy}, 48 * 3, st.foreground);
++        int mn = 127, mx = -128, sum = 0;
++        for (int i = 0; i < n_; i++) {
++            const int v = snr2_[i];
++            mn = v < mn ? v : mn;
++            mx = v > mx ? v : mx;
++            sum += v;
++            int hh = (v + 40) * 36 / 64;
++            hh = hh < 1 ? 1 : hh > 36 ? 36 : hh;
++            painter.fill_rectangle({gx + i * 3, gy - hh, 2, hh}, v >= 6 ? Color::green() : v >= -6 ? Color::yellow() : Color::red());
++        }
++        if (n_) {
++            painter.draw_string({x0 + 156, y0 + 132}, st, "max " + to_string_dec_int(mx / 2));
++            painter.draw_string({x0 + 156, y0 + 148}, st, "min " + to_string_dec_int(mn / 2));
++            painter.draw_string({x0 + 156, y0 + 164}, st, "avg " + to_string_dec_int(sum / n_ / 2));
++        }
 +    }
 +
 +    if (exact) {
@@ -2217,7 +2241,7 @@ index c6181f9..bd371dc 100644
  // ============================================================================
  // MeshtasticSeenView
  // ============================================================================
-@@ -3588,3507 +2199,155 @@ void MeshtasticSeenView::paint(Painter& painter) {
+@@ -3588,3507 +2223,155 @@ void MeshtasticSeenView::paint(Painter& painter) {
                              to_string_dec_uint(static_cast<uint32_t>(scroll_ + 1)) + "-)");
  }
  
@@ -5862,7 +5886,7 @@ index c6181f9..bd371dc 100644
  }
  
  size_t MeshtasticView::derive_channel_key(const std::string& text, uint8_t out[32]) {
-@@ -7118,12 +2377,203 @@ size_t MeshtasticView::derive_channel_key(const std::string& text, uint8_t out[3
+@@ -7118,12 +2401,203 @@ size_t MeshtasticView::derive_channel_key(const std::string& text, uint8_t out[3
      return 16;
  }
  
@@ -6071,7 +6095,7 @@ index c6181f9..bd371dc 100644
      if (cfg_.primary_name.empty()) {
          channel_hash_ = meshtastic::preset_channel_hash(cfg_.preset_idx, DEFAULT_PSK,
                                                          sizeof(DEFAULT_PSK));
-@@ -7132,7 +2582,7 @@ void MeshtasticView::apply_channels() {
+@@ -7132,7 +2606,7 @@ void MeshtasticView::apply_channels() {
                                                   sizeof(DEFAULT_PSK));
      }
      router_.set_channel(0, channel_hash_, DEFAULT_PSK, sizeof(DEFAULT_PSK), true);
@@ -6080,7 +6104,7 @@ index c6181f9..bd371dc 100644
      for (int i = 0; i < MeshSettings::NUM_CUSTOM; i++) {
          const bool on = cfg_.ch_enabled[i] && !cfg_.ch_name[i].empty();
          if (on) {
-@@ -7148,46 +2598,28 @@ void MeshtasticView::apply_channels() {
+@@ -7148,46 +2622,28 @@ void MeshtasticView::apply_channels() {
      if (cfg_.active_channel > MeshSettings::NUM_CUSTOM) cfg_.active_channel = 0;
      if (cfg_.active_channel != 0 &&
          !(cfg_.ch_enabled[cfg_.active_channel - 1] && !cfg_.ch_name[cfg_.active_channel - 1].empty()))
@@ -6147,7 +6171,7 @@ index c6181f9..bd371dc 100644
  }
  
  void MeshtasticView::save_known_nodes() {
-@@ -7284,178 +2716,74 @@ void MeshtasticView::load_known_nodes() {
+@@ -7284,178 +2740,74 @@ void MeshtasticView::load_known_nodes() {
      }
  }
  
