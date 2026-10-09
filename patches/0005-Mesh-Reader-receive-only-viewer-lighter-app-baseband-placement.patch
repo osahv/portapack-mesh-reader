@@ -2,8 +2,62 @@ From: osahv <osahv@users.noreply.github.com>
 Subject: [PATCH 5/5] Mesh Reader: receive-only viewer, Find screen, lighter app, baseband placement
 
 ---
+diff --git a/firmware/application/apps/mesh/mesh_nodedb.cpp b/firmware/application/apps/mesh/mesh_nodedb.cpp
+index e29c137..3f09e5e 100644
+--- a/firmware/application/apps/mesh/mesh_nodedb.cpp
++++ b/firmware/application/apps/mesh/mesh_nodedb.cpp
+@@ -137,13 +137,14 @@ void NodeDB::update_telemetry(uint32_t node_id, const TelemetryData& tel) {
+     }
+ }
+ 
+-void NodeDB::update_signal(uint32_t node_id, int8_t rssi, float snr, uint8_t hops, uint32_t uptime) {
++void NodeDB::update_signal(uint32_t node_id, int8_t rssi, float snr, uint8_t hops, uint32_t uptime, uint8_t relay) {
+     auto* e = find(node_id);
+     if (!e) e = insert(node_id);
+     if (!e) return;
+     e->last_rssi = rssi;
+     e->last_snr = snr;
+     e->hop_count = hops;
++    e->last_relay = relay;
+     if (e->first_seen_uptime == 0) e->first_seen_uptime = uptime;  // discovery time
+     e->last_seen_uptime = uptime;
+ }
+diff --git a/firmware/application/apps/mesh/mesh_nodedb.hpp b/firmware/application/apps/mesh/mesh_nodedb.hpp
+index 7470928..80ece44 100644
+--- a/firmware/application/apps/mesh/mesh_nodedb.hpp
++++ b/firmware/application/apps/mesh/mesh_nodedb.hpp
+@@ -53,6 +53,7 @@ struct NodeEntry {
+     int8_t last_rssi{0};
+     Fixed<int8_t, 4> last_snr{0.0f};  // dB in quarter-dB steps, +-31.75
+     uint8_t hop_count{0};
++    uint8_t last_relay{0};  // low byte of the node that last relayed a frame of this node (0 = direct / unknown)
+     // What this node last told the mesh about its own neighbours (portnum 71): how
+     // many it hears directly, and - when we are one of them - the signal it hears US
+     // at. That last figure is the half of the link our own receiver cannot measure.
+@@ -162,7 +163,7 @@ class NodeDB {
+     void update_telemetry(uint32_t node_id, const TelemetryData& tel);
+ 
+     // Update signal info from a received packet.
+-    void update_signal(uint32_t node_id, int8_t rssi, float snr, uint8_t hops, uint32_t uptime);
++    void update_signal(uint32_t node_id, int8_t rssi, float snr, uint8_t hops, uint32_t uptime, uint8_t relay = 0);
+ 
+     // Store a node's Curve25519 public key (NodeInfo field 8), enabling PKC DMs.
+     void set_pubkey(uint32_t node_id, const uint8_t pub[32]);
+diff --git a/firmware/application/apps/mesh/mesh_router.cpp b/firmware/application/apps/mesh/mesh_router.cpp
+index f3bd55e..e267655 100644
+--- a/firmware/application/apps/mesh/mesh_router.cpp
++++ b/firmware/application/apps/mesh/mesh_router.cpp
+@@ -215,7 +215,7 @@ bool MeshRouter::on_raw_rx(const uint8_t* raw, size_t len, int8_t rssi, float sn
+     const uint8_t hs = pkt.header.hop_start(), hl = pkt.header.hop_limit();
+     node_db_.update_signal(pkt.header.from, rssi, snr,
+                            (hs >= hl) ? (hs - hl) : 0,
+-                           uptime_ticks);
++                           uptime_ticks, pkt.header.relay_node);
+     // A node we can hear but cannot name has never sent us its NodeInfo, so we have
+     // neither its name nor its public key. Ask. It is the same request the phone app
+     // calls "exchange user info", and it is what fills the node list with names.
 diff --git a/firmware/application/apps/ui_meshtastic.cpp b/firmware/application/apps/ui_meshtastic.cpp
-index c6181f9..21dcd37 100644
+index c6181f9..bd371dc 100644
 --- a/firmware/application/apps/ui_meshtastic.cpp
 +++ b/firmware/application/apps/ui_meshtastic.cpp
 @@ -6,7 +6,6 @@
@@ -1135,7 +1189,7 @@ index c6181f9..21dcd37 100644
          } else if (l.size() > 2 && l[0] >= 'A' && l[0] <= 'Z' && l[1] == '[') {
              // One build wrote the colour as a letter before the timestamp. Read it back
              // rather than leave a stray capital at the start of every old line.
-@@ -2314,56 +1313,9 @@ void MeshtasticChatView::load_history() {
+@@ -2314,54 +1313,7 @@ void MeshtasticChatView::load_history() {
          f.reset();
          delete_file(path);
          rename_file(tmp, path);
@@ -1147,9 +1201,9 @@ index c6181f9..21dcd37 100644
 -            if (mm.hist_peer != dest_id_ || mm.hist_ch != channel_idx_) continue;
 -            mm.hist_offset = (mm.hist_offset > dropped) ? mm.hist_offset - dropped : 0;
 -        }
-     }
- }
- 
+-    }
+-}
+-
 -void MeshtasticChatView::apply_dest_label() {
 -    if (dest_id_ == BROADCAST_ADDR) {
 -        button_dest_.set_text(">All");
@@ -1182,16 +1236,14 @@ index c6181f9..21dcd37 100644
 -                break;
 -            }
 -        }
--    }
+     }
 -    apply_dest_label();
 -    update_padlock();
 -    text_rssi_.hidden(!display_.show_db);
 -    if (changed) switch_conversation();
--}
--
+ }
+ 
  void MeshtasticChatView::paint(Painter& painter) {
-     const auto r = screen_rect();
-     painter.fill_rectangle({r.left(), r.top(), screen_width, STATUS_H},
 @@ -2391,79 +1343,7 @@ void MeshtasticChatView::paint(Painter& painter) {
      painter.fill_rectangle({px + 4, py + 10, 1, 3}, bg);  // keyhole slot
  }
@@ -1282,7 +1334,7 @@ index c6181f9..21dcd37 100644
      if (here) {
          console_.set_message_index(messages_.size() - 1);  // tap this line for details
          // Start clean: these flags are raised by anything the console renders, and
-@@ -2606,563 +1485,15 @@ void MeshtasticChatView::on_packet(const MeshPacket& pkt) {
+@@ -2606,554 +1485,6 @@ void MeshtasticChatView::on_packet(const MeshPacket& pkt) {
      set_pkt_indicator(false);
  }
  
@@ -1834,14 +1886,10 @@ index c6181f9..21dcd37 100644
 -    field_off_.focus();
 -}
 -
--// ============================================================================
--// MeshtasticNodesView
--// ============================================================================
-+// ============================================================================
-+// MeshtasticNodesView
-+// ============================================================================
- 
- MeshtasticNodesView::MeshtasticNodesView(NavigationView& nav,
+ // ============================================================================
+ // MeshtasticNodesView
+ // ============================================================================
+@@ -3162,7 +1493,7 @@ MeshtasticNodesView::MeshtasticNodesView(NavigationView& nav,
                                           NodeDB& node_db,
                                           Rect parent_rect)
      : View(parent_rect), nav_(nav), node_db_(node_db) {
@@ -1876,7 +1924,7 @@ index c6181f9..21dcd37 100644
  }
  
  bool MeshtasticNodesView::on_encoder(const EncoderEvent delta) {
-@@ -3448,6 +1773,165 @@ void MeshtasticNodesView::refresh() {
+@@ -3448,6 +1773,292 @@ void MeshtasticNodesView::refresh() {
      set_dirty();
  }
  
@@ -1889,8 +1937,13 @@ index c6181f9..21dcd37 100644
 +
 +MeshtasticFinderView::MeshtasticFinderView(NavigationView& nav, NodeDB& node_db, uint32_t node_id, MeshOwn& own, std::function<void(uint32_t)> on_set_me)
 +    : nav_(nav), node_db_(node_db), node_id_(node_id), own_(own), on_set_me_(std::move(on_set_me)) {
-+    add_children({&button_close_, &button_me_});
++    add_children({&button_close_, &button_info_, &button_me_});
 +    button_close_.on_select = [this](Button&) { nav_.pop(); };
++    button_info_.on_select = [this](Button&) {
++        page_ = static_cast<uint8_t>((page_ + 1) % 3);
++        button_info_.set_text(page_ == 0 ? "Info" : page_ == 1 ? "Route" : "Signal");
++        set_dirty();
++    };
 +    // "I carry this node": its own position reports become where I am.
 +    button_me_.on_select = [this](Button&) {
 +        if (on_set_me_) on_set_me_(node_id_);
@@ -1932,6 +1985,118 @@ index c6181f9..21dcd37 100644
 +    }
 +}
 +
++// "5s", "3m", "2h", "4d"; "--" when unknown.
++static std::string age_str(uint32_t secs, bool known = true) {
++    if (!known) return "--";
++    if (secs < 60) return to_string_dec_uint(secs) + "s";
++    if (secs < 3600) return to_string_dec_uint(secs / 60) + "m";
++    if (secs < 86400) return to_string_dec_uint(secs / 3600) + "h";
++    return to_string_dec_uint(secs / 86400) + "d";
++}
++
++// Everything the node has told us about itself, one fact per line.
++void MeshtasticFinderView::paint_info(Painter& painter, const NodeEntry& e, int x0, int y0) {
++    const auto& st = *Theme::getInstance()->fg_light;
++    const auto& bg = Theme::getInstance()->bg_darkest->background;
++    int y = y0;
++    const auto line = [&](const std::string& t) {
++        painter.draw_string({x0, y}, st, t);
++        y += 16;
++    };
++    draw_utf8({x0, y}, utf8_cols(e.long_name[0] ? std::string(e.long_name) : std::string("(no name yet)"), 29), st.foreground, bg);
++    y += 16;
++    line("short " + std::string(e.short_name[0] ? e.short_name : "-") + "  id !" + to_string_hex(e.node_id, 8));
++    line(std::string(e.hw_model ? hw_model_name(e.hw_model) : "device ?") + " / " + mesh_role_name(e.role));
++    const uint32_t first = (now_ticks_ > e.first_seen_uptime) ? (now_ticks_ - e.first_seen_uptime) / 60u : 0;
++    const uint32_t last = (now_ticks_ > e.last_seen_uptime) ? (now_ticks_ - e.last_seen_uptime) / 60u : 0;
++    line("first " + age_str(first) + " ago, last " + age_str(last));
++    line("rssi " + to_string_dec_int(e.last_rssi) + " snr " + to_string_decimal(static_cast<float>(e.last_snr), 1) + " hop " + to_string_dec_uint(e.hop_count));
++    if (e.nbr_count || e.nbr_hears_us)
++        line("hears " + to_string_dec_uint(e.nbr_count) + " nodes" +
++             (e.nbr_hears_us ? ", us at " + to_string_decimal(static_cast<float>(e.nbr_snr_to_us), 1) + "dB" : std::string()));
++    if (e.has_telemetry) {
++        const float bl = static_cast<float>(e.battery_level);
++        std::string t = bl > 100.0f ? "charging" : (bl >= 0 ? to_string_dec_uint(static_cast<uint32_t>(bl)) + "%" : std::string("?%"));
++        const float v = static_cast<float>(e.voltage);
++        if (v >= 0) t += "  " + to_string_decimal(v, 2) + "V";
++        if (e.uptime_seconds) t += "  up " + age_str(e.uptime_seconds);
++        line("batt " + t);
++        const float cu = static_cast<float>(e.channel_utilization), au = static_cast<float>(e.air_util_tx);
++        if (cu >= 0) line("chan " + to_string_decimal(cu, 1) + "%  air tx " + to_string_decimal(au >= 0 ? au : 0.0f, 1) + "%");
++    }
++    if (e.has_env_data) {
++        std::string t;
++        const float tm = static_cast<float>(e.temperature), hu = static_cast<float>(e.humidity), pr = static_cast<float>(e.pressure);
++        if (tm > -900) t += to_string_decimal(tm, 1) + "C ";
++        if (hu >= 0) t += to_string_decimal(hu, 0) + "% ";
++        if (pr >= 0) t += to_string_decimal(pr, 0) + "hPa";
++        line(t);
++    }
++    if (e.has_position && e.position.valid) {
++        line(to_string_decimal(static_cast<float>(static_cast<double>(e.position.latitude)), 5) + " " +
++             to_string_decimal(static_cast<float>(static_cast<double>(e.position.longitude)), 5));
++        const uint32_t pa = e.position.timestamp && now_unix() > e.position.timestamp ? now_unix() - e.position.timestamp : 0;
++        line("alt " + to_string_dec_int(e.position.altitude_m) + "m sats " + to_string_dec_uint(e.position.satellites_in_view) +
++             (e.position.timestamp ? ", fix " + age_str(pa) + " ago" : std::string()));
++    } else {
++        line("no position sent");
++    }
++    line(std::string(e.has_pubkey ? "key yes" : "key no") + ", " + (e.unmessagable ? "not messagable" : "messagable"));
++}
++
++// A node by the low sixteen bits of its id (all a route entry carries): its name when it is in the table.
++static std::string node_label(const NodeDB& db, uint16_t low) {
++    for (size_t i = 0; i < db.count(); i++) {
++        const NodeEntry* n = db.at(i);
++        if (n && n->active && static_cast<uint16_t>(n->node_id & 0xFFFFu) == low)
++            return n->short_name[0] ? std::string(n->short_name) : to_string_hex(low, 4);
++    }
++    return to_string_hex(low, 4);
++}
++
++// What the air has shown about how this node's frames get here: hops, the node that last relayed one, and any
++// traceroute answer that went past. Nothing is sent to find out.
++void MeshtasticFinderView::paint_route(Painter& painter, const NodeEntry& e, int x0, int y0) {
++    const auto& st = *Theme::getInstance()->fg_light;
++    const auto& bg = Theme::getInstance()->bg_darkest->background;
++    int y = y0;
++    const auto line = [&](const std::string& t) {
++        painter.draw_string({x0, y}, st, t);
++        y += 16;
++    };
++    draw_utf8({x0, y}, utf8_cols(e.long_name[0] ? std::string(e.long_name) : to_string_hex(node_id_, 8), 29), st.foreground, bg);
++    y += 16;
++    line(e.hop_count == 0 ? "direct (0 hops)" : to_string_dec_uint(e.hop_count) + (e.hop_count == 1 ? " hop" : " hops"));
++    if (e.last_relay) {
++        // The header carries only the low byte of the relaying node: list the known nodes that match it.
++        std::string c;
++        for (size_t i = 0; i < node_db_.count(); i++) {
++            const NodeEntry* n = node_db_.at(i);
++            if (n && n->active && n->node_id != node_id_ && static_cast<uint8_t>(n->node_id & 0xFFu) == e.last_relay)
++                c += (c.empty() ? "" : ",") + std::string(n->short_name[0] ? n->short_name : "?");
++        }
++        line("last relay ..." + to_string_hex(e.last_relay, 2) + (c.empty() ? std::string() : " " + c));
++    } else {
++        line("last relay: none");
++    }
++    y += 8;
++    line("traceroutes heard:");
++    bool any = false;
++    for (size_t i = 0; i < node_db_.route_count() && y < 250; i++) {
++        const auto& r = node_db_.route(i);
++        std::string t = (r.node_id == node_id_ ? ">" : " ") + node_label(node_db_, static_cast<uint16_t>(r.node_id & 0xFFFFu)) + ": ";
++        if (!r.hop_count) {
++            t += "direct";
++        } else {
++            for (uint8_t k = 0; k < r.hop_count && k < 3; k++) t += (k ? " " : "") + node_label(node_db_, r.hops[k]);
++            if (r.hop_count > 3) t += " +";
++        }
++        line(t);
++        any = true;
++    }
++    if (!any) line("none yet (needs a trace)");
++}
++
 +void MeshtasticFinderView::paint(Painter& painter) {
 +    const auto& bg = Theme::getInstance()->bg_darkest->background;
 +    const auto& st = *Theme::getInstance()->fg_light;
@@ -1945,19 +2110,28 @@ index c6181f9..21dcd37 100644
 +        painter.draw_string({x0, y0}, st, "node gone");
 +        return;
 +    }
++    if (page_ == 1) {
++        paint_info(painter, *e, x0, y0);
++        return;
++    }
++    if (page_ == 2) {
++        paint_route(painter, *e, x0, y0);
++        return;
++    }
 +    draw_utf8({x0, y0}, utf8_cols(e->long_name[0] ? std::string(e->long_name) : to_string_hex(node_id_, 8), 29), st.foreground, bg);
 +    const float snr = static_cast<float>(e->last_snr);
 +    painter.draw_string({x0, y0 + 16}, st,
 +                        "RSSI " + to_string_dec_int(e->last_rssi) + "  SNR " + to_string_dec_int(static_cast<int>(snr)) +
 +                            "  hop " + to_string_dec_uint(e->hop_count));
 +    const uint32_t age = (now_ticks_ > e->last_seen_uptime) ? (now_ticks_ - e->last_seen_uptime) / 60u : 0;
-+    painter.draw_string({x0, y0 + 32}, st, "heard " + to_string_dec_uint(age) + " s ago, n=" + to_string_dec_uint(n_));
++    painter.draw_string({x0, y0 + 32}, st, "heard " + age_str(age) + " ago, n=" + to_string_dec_uint(n_));
++    painter.draw_string({x0, y0 + 48}, st,
++                        std::string(e->hw_model ? hw_model_name(e->hw_model) : "device ?") + " / " + mesh_role_name(e->role));
 +
 +    // Proximity by signal-to-noise: the figure that means something on a HackRF (RSSI here is in relative units).
 +    const char* word = snr >= 8 ? "VERY CLOSE" : snr >= 3 ? "CLOSE" : snr >= -3 ? "MEDIUM" : snr >= -10 ? "FAR" : "VERY FAR";
 +    // Trend: newest three samples against the three before them.
 +    const char* trend = "";
-+    Color tc = st.foreground;
 +    if (n_ >= 6) {
 +        int a = 0, b = 0;
 +        for (int i = 0; i < 3; i++) {
@@ -1965,33 +2139,11 @@ index c6181f9..21dcd37 100644
 +            b += snr2_[n_ - 4 - i];
 +        }
 +        const int d = (a - b) / 3;  // half-dB
-+        if (d >= 2) {
-+            trend = "  WARMER";
-+            tc = Color::green();
-+        } else if (d <= -2) {
-+            trend = "  COLDER";
-+            tc = Color::red();
-+        } else {
-+            trend = "  same";
-+        }
++        trend = d >= 2 ? "  WARMER" : d <= -2 ? "  COLDER" : "  same";
 +    }
-+    painter.draw_string({x0, y0 + 52}, Theme::getInstance()->fg_yellow ? *Theme::getInstance()->fg_yellow : st, word);
-+    painter.draw_string({x0 + 8 * 11, y0 + 52}, st, trend);
-+    (void)tc;
++    painter.draw_string({x0, y0 + 64}, Theme::getInstance()->fg_yellow ? *Theme::getInstance()->fg_yellow : st, word);
++    painter.draw_string({x0 + 8 * 11, y0 + 64}, st, trend);
 +
-+    // SNR history: one bar per packet, -20..+12 dB mapped to 0..60 px, newest on the right.
-+    const int gy = y0 + 76 + 60;
-+    painter.draw_hline({x0, gy}, screen_width, st.foreground);
-+    for (int i = 0; i < n_; i++) {
-+        int h = (snr2_[i] + 40) * 60 / 64;
-+        if (h < 1) h = 1;
-+        if (h > 60) h = 60;
-+        const Color c = snr2_[i] >= 6 ? Color::green() : snr2_[i] >= -6 ? Color::yellow() : Color::red();
-+        painter.fill_rectangle({x0 + i * 5, gy - h, 4, h}, c);
-+    }
-+
-+    // Bearing and distance, when both ends have a position.
-+    const int cy = y0 + 215;
 +    // Where I am: live GPS, else the latest position of the node I carry (never the node being looked for).
 +    float own_lat = 0.0f, own_lon = 0.0f;
 +    bool have_own = false;
@@ -2008,26 +2160,49 @@ index c6181f9..21dcd37 100644
 +            }
 +        }
 +    }
-+    if (e->has_position && e->position.valid && have_own) {
++    const bool exact = e->has_position && e->position.valid && have_own;
++    float dist = 0.0f, brg = 0.0f;
++    if (exact) {
 +        const float lat = static_cast<float>(static_cast<double>(e->position.latitude));
 +        const float lon = static_cast<float>(static_cast<double>(e->position.longitude));
 +        const float dy = (lat - own_lat) * 111320.0f;
 +        const float dx = (lon - own_lon) * 111320.0f * cosf(own_lat * 0.0174533f);
-+        const float dist = sqrtf(dx * dx + dy * dy);
-+        float brg = atan2f(dx, dy) * 57.29578f;
++        dist = sqrtf(dx * dx + dy * dy);
++        brg = atan2f(dx, dy) * 57.29578f;
 +        if (brg < 0) brg += 360.0f;
++    } else {
++        // Rough range from the signal-to-noise: a log-distance model, 10 dB at 100 m, exponent 2.7. The reference is a
++        // guess to be calibrated against a known distance; walls and antennas move it by a factor of two or three.
++        dist = 100.0f * powf(10.0f, (10.0f - snr) / 27.0f);
++        if (dist < 5.0f) dist = 5.0f;
++        if (dist > 20000.0f) dist = 20000.0f;
++    }
++    {
++        const std::string d = dist >= 1000.0f ? to_string_decimal(dist / 1000.0f, 1) + " km"
++                                              : to_string_dec_uint(static_cast<uint32_t>(dist < 100.0f ? dist : (dist / 10.0f) * 10.0f)) + " m";
++        painter.draw_string({x0, y0 + 80}, st, exact ? "distance " + d : "~" + d + " by signal");
++    }
++
++    // SNR history: one bar per packet, -20..+12 dB mapped to 0..60 px, newest on the right.
++    const int gy = y0 + 164;
++    painter.draw_hline({x0, gy}, screen_width, st.foreground);
++    for (int i = 0; i < n_; i++) {
++        int hh = (snr2_[i] + 40) * 60 / 64;
++        if (hh < 1) hh = 1;
++        if (hh > 60) hh = 60;
++        const Color c = snr2_[i] >= 6 ? Color::green() : snr2_[i] >= -6 ? Color::yellow() : Color::red();
++        painter.fill_rectangle({x0 + i * 5, gy - hh, 4, hh}, c);
++    }
++
++    if (exact) {
 +        static const char* const NAMES[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
 +        const int ib = static_cast<int>((brg + 22.5f) / 45.0f) & 7;
 +        painter.draw_string({x0, y0 + 216}, st, NAMES[ib]);
 +        painter.draw_string({x0, y0 + 232}, st, to_string_dec_uint(static_cast<uint32_t>(brg)) + " deg");
-+        painter.draw_string({x0, y0 + 248}, st,
-+                            dist >= 1000.0f ? to_string_decimal(dist / 1000.0f, 1) + " km"
-+                                            : to_string_dec_uint(static_cast<uint32_t>(dist)) + " m");
 +        // North-up arrow: dots along the bearing with a block at the tip.
-+        const int cx = x0 + 170, rad = 46;
++        const int cx = x0 + 170, cy = y0 + 230, rad = 34;
 +        const float sb = sinf(brg * 0.0174533f), cb = cosf(brg * 0.0174533f);
-+        painter.fill_rectangle({cx - 1, cy - rad - 10, 3, 3}, st.foreground);
-+        painter.draw_string({cx - 4, cy - rad - 28}, st, "N");
++        painter.draw_string({cx - 4, cy - rad - 20}, st, "N");
 +        for (int t = 8; t < rad; t += 6)
 +            painter.fill_rectangle({cx + static_cast<int>(t * sb) - 1, cy - static_cast<int>(t * cb) - 1, 3, 3}, Color::green());
 +        painter.fill_rectangle({cx + static_cast<int>(rad * sb) - 3, cy - static_cast<int>(rad * cb) - 3, 7, 7}, Color::green());
@@ -2042,7 +2217,7 @@ index c6181f9..21dcd37 100644
  // ============================================================================
  // MeshtasticSeenView
  // ============================================================================
-@@ -3588,3507 +2072,155 @@ void MeshtasticSeenView::paint(Painter& painter) {
+@@ -3588,3507 +2199,155 @@ void MeshtasticSeenView::paint(Painter& painter) {
                              to_string_dec_uint(static_cast<uint32_t>(scroll_ + 1)) + "-)");
  }
  
@@ -5687,7 +5862,7 @@ index c6181f9..21dcd37 100644
  }
  
  size_t MeshtasticView::derive_channel_key(const std::string& text, uint8_t out[32]) {
-@@ -7118,12 +2250,175 @@ size_t MeshtasticView::derive_channel_key(const std::string& text, uint8_t out[3
+@@ -7118,12 +2377,203 @@ size_t MeshtasticView::derive_channel_key(const std::string& text, uint8_t out[3
      return 16;
  }
  
@@ -5745,6 +5920,34 @@ index c6181f9..21dcd37 100644
 +                unix_to_rtc(peer_time, t);
 +                rtc_time::set(t);
 +            }
++        }
++        // A RouteDiscovery that carries a request_id is the answer to somebody's trace: field 1 lists the nodes it crossed.
++        // A stock node packs the list (tag 0x0A), others write an entry at a time (0x0D); anything else ends the walk.
++        // Heard in passing, whoever asked: the journal shows how the answering node is reached.
++        if (pkt.data.portnum == PortNum::TRACEROUTE && pkt.data.request_id && !pkt.damaged) {
++            size_t hops = 0;
++            uint16_t via[3]{};
++            const uint8_t* p = pkt.data.payload;
++            const uint8_t* const end = p + pkt.data.payload_len;
++            while (p < end) {
++                size_t n = 0;
++                if (*p == 0x0D) {
++                    p++;
++                    n = 4;
++                } else if (*p == 0x0A && end - p >= 2) {
++                    n = p[1];
++                    p += 2;
++                } else {
++                    break;
++                }
++                if (static_cast<size_t>(end - p) < n) break;
++                for (; n >= 4; n -= 4, p += 4) {
++                    const uint32_t id = p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<uint32_t>(p[3]) << 24);
++                    if (hops < 3) via[hops] = static_cast<uint16_t>(id & 0xFFFF);
++                    hops++;
++                }
++            }
++            node_db_.add_route(pkt.header.from, uptime_ticks_, via, static_cast<uint8_t>(hops > 3 ? 3 : hops));
 +        }
 +        chat_view_.on_packet(pkt);
 +        nodes_view_.refresh();
@@ -5868,7 +6071,7 @@ index c6181f9..21dcd37 100644
      if (cfg_.primary_name.empty()) {
          channel_hash_ = meshtastic::preset_channel_hash(cfg_.preset_idx, DEFAULT_PSK,
                                                          sizeof(DEFAULT_PSK));
-@@ -7132,7 +2427,7 @@ void MeshtasticView::apply_channels() {
+@@ -7132,7 +2582,7 @@ void MeshtasticView::apply_channels() {
                                                   sizeof(DEFAULT_PSK));
      }
      router_.set_channel(0, channel_hash_, DEFAULT_PSK, sizeof(DEFAULT_PSK), true);
@@ -5877,7 +6080,7 @@ index c6181f9..21dcd37 100644
      for (int i = 0; i < MeshSettings::NUM_CUSTOM; i++) {
          const bool on = cfg_.ch_enabled[i] && !cfg_.ch_name[i].empty();
          if (on) {
-@@ -7148,46 +2443,28 @@ void MeshtasticView::apply_channels() {
+@@ -7148,46 +2598,28 @@ void MeshtasticView::apply_channels() {
      if (cfg_.active_channel > MeshSettings::NUM_CUSTOM) cfg_.active_channel = 0;
      if (cfg_.active_channel != 0 &&
          !(cfg_.ch_enabled[cfg_.active_channel - 1] && !cfg_.ch_name[cfg_.active_channel - 1].empty()))
@@ -5944,7 +6147,7 @@ index c6181f9..21dcd37 100644
  }
  
  void MeshtasticView::save_known_nodes() {
-@@ -7284,178 +2561,74 @@ void MeshtasticView::load_known_nodes() {
+@@ -7284,178 +2716,74 @@ void MeshtasticView::load_known_nodes() {
      }
  }
  
@@ -6175,7 +6378,7 @@ index c6181f9..21dcd37 100644
  
  }  // namespace ui
 diff --git a/firmware/application/apps/ui_meshtastic.hpp b/firmware/application/apps/ui_meshtastic.hpp
-index 695c7b4..eaa8261 100644
+index 695c7b4..bd67359 100644
 --- a/firmware/application/apps/ui_meshtastic.hpp
 +++ b/firmware/application/apps/ui_meshtastic.hpp
 @@ -508,6 +508,7 @@ struct MeshSettings {
@@ -6782,7 +6985,7 @@ index 695c7b4..eaa8261 100644
  class MeshtasticSeenView : public View {
     public:
      MeshtasticSeenView(NavigationView& nav, meshtastic::NodeDB& node_db, uint32_t now_ticks);
-@@ -1350,6 +918,45 @@ class MeshtasticSeenView : public View {
+@@ -1350,6 +918,49 @@ class MeshtasticSeenView : public View {
      void scroll_by(int delta);
  };
  
@@ -6821,14 +7024,18 @@ index 695c7b4..eaa8261 100644
 +    int8_t rssi_[NS]{};
 +    uint8_t n_{0};        // samples stored (newest last)
 +    void push_sample(int8_t rssi, int8_t snr2);
-+    Button button_close_{{0, 272, 160, 32}, "Close"};
++    uint8_t page_{0};  // 0 signal, 1 info, 2 route
++    void paint_info(Painter& painter, const meshtastic::NodeEntry& e, int x0, int y0);
++    void paint_route(Painter& painter, const meshtastic::NodeEntry& e, int x0, int y0);
++    Button button_close_{{0, 272, 80, 32}, "Close"};
++    Button button_info_{{80, 272, 80, 32}, "Info"};
 +    Button button_me_{{160, 272, 80, 32}, "Me"};
 +};
 +
  // ---- Tab: Nodes  (index 1) -------------------------------------------------
  
  class MeshtasticNodesView : public View {
-@@ -1365,13 +972,10 @@ class MeshtasticNodesView : public View {
+@@ -1365,13 +976,10 @@ class MeshtasticNodesView : public View {
      bool on_key(const KeyEvent key) override;
      bool on_touch(const TouchEvent event) override;
      void refresh();
@@ -6846,7 +7053,7 @@ index 695c7b4..eaa8261 100644
      // Current uptime (ticks) for "last heard" ages; repaints ~1/s while shown.
      void set_now(uint32_t ticks) {
          if (!hidden() && ticks >= now_ticks_ + 60) set_dirty();
-@@ -1397,13 +1001,12 @@ class MeshtasticNodesView : public View {
+@@ -1397,13 +1005,12 @@ class MeshtasticNodesView : public View {
      NavigationView& nav_;
      meshtastic::NodeDB& node_db_;
  
@@ -6862,7 +7069,7 @@ index 695c7b4..eaa8261 100644
      // Newest first by default: a node that just appeared is the interesting one.
      Sort sort_{Sort::Age};
      bool sort_desc_{true};
-@@ -1434,963 +1037,73 @@ class MeshtasticNodesView : public View {
+@@ -1434,963 +1041,73 @@ class MeshtasticNodesView : public View {
      // at best - so the button now carries it, and says which way round it is.
      Button button_sort_{{60, BOT_Y, 57, BOT_H}, "Age v"};
      // Every node heard, including the ones the table had no room for (see MeshtasticSeenView).
@@ -7844,7 +8051,7 @@ index 695c7b4..eaa8261 100644
  
      MessageHandlerRegistration handler_lora_{
          Message::ID::LoRaPacket,
-@@ -2398,33 +1111,10 @@ class MeshtasticView : public View {
+@@ -2398,33 +1115,10 @@ class MeshtasticView : public View {
              on_lora_packet(static_cast<const LoRaPacketMessage*>(p));
          }};
  
@@ -7880,7 +8087,7 @@ index 695c7b4..eaa8261 100644
  
      MessageHandlerRegistration handler_frame_{
 diff --git a/firmware/application/ui_navigation.cpp b/firmware/application/ui_navigation.cpp
-index 1f025a5..178a2f1 100644
+index 1f025a5..7fdd033 100644
 --- a/firmware/application/ui_navigation.cpp
 +++ b/firmware/application/ui_navigation.cpp
 @@ -98,7 +98,7 @@ const NavigationView::AppList NavigationView::appList = {
@@ -7888,7 +8095,7 @@ index 1f025a5..178a2f1 100644
      {"audio", "Audio", RX, Color::green(), &bitmap_icon_speaker, new ViewFactory<AnalogAudioView>()},
      {"blerx", "BLE Rx", RX, Color::green(), &bitmap_icon_btle, new ViewFactory<BLERxView>()},
 -    {"meshtastic", "Mesh", TRX, Color::green(), &bitmap_icon_meshtastic, new ViewFactory<MeshtasticView>()},
-+    {"meshtastic", "MeshRead", TRX, Color::green(), &bitmap_icon_meshtastic, new ViewFactory<MeshtasticView>()},
++    {"meshtastic", "MeshRead", RX, Color::green(), &bitmap_icon_meshtastic, new ViewFactory<MeshtasticView>()},
      {"pocsag", "POCSAG", RX, Color::green(), &bitmap_icon_pocsag, new ViewFactory<POCSAGAppView>()},
      {"radiosonde", "Radiosnde", RX, Color::green(), &bitmap_icon_sonde, new ViewFactory<SondeView>()},
      {"search", "Search", RX, Color::yellow(), &bitmap_icon_search, new ViewFactory<SearchView>()},

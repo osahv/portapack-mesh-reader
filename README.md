@@ -33,7 +33,7 @@ Mayhem apps keep working next to it.
 1. Back up your SD card (`FIRMWARE`, `APPS`, `BASEBAND`, `SETTINGS`).
 2. Unpack the release into the **root of the SD card** (merge with the existing folders). `FIRMWARE`, `APPS` and `BASEBAND`
    must all come from the same build: apps with another version hash are greyed out, and a missing baseband shows `NoImg`.
-3. **Utilities → Flash Utility →** `portapack-mayhem_mesh-reader-2.bin`.
+3. **Utilities → Flash Utility →** `portapack-mayhem_mesh-reader-3.bin`.
 4. Edit `/SETTINGS/meshtastic.ini`: `region`, `preset`, `fslot` must match your network, and add your channels
    (`c1_name`, `c1_key` as 32 or 64 hex digits, `c1_en=1`, …). `tools/mesh_channels_to_ini.py` copies them from a node over USB:
 
@@ -64,7 +64,7 @@ with LNA 16-24 and VGA 16-24 (the `L:` `V:` fields in the Chat status row, or `r
 scripts/build.sh   # needs Docker; fetches PR #3306 at the tested commit 51135ec, applies patches/, builds
 ```
 
-Output: `dist/mesh-reader-2/{FIRMWARE,APPS,BASEBAND}`. The full-featured variant with sending lives in
+Output: `dist/mesh-reader-3/{FIRMWARE,APPS,BASEBAND}`. The full-featured variant with sending lives in
 [portapack-mesh](https://github.com/osahv/portapack-mesh).
 
 ## Credits and license
