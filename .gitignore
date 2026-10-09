@@ -1,0 +1,4 @@
+build/
+dist/
+sd-backup-*/
+.DS_Store
