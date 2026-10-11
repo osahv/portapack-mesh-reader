@@ -13,6 +13,21 @@ Mayhem apps keep working next to it.
 > Wireless Paper on a private mesh with custom AES-256 channels. Messages, nodes, Cyrillic text and the "All heard" list work.
 > The Mesh code is unmerged upstream work; this is an unofficial build. Not affiliated with Meshtastic, Mayhem or the PR author.
 
+## Screens
+
+<p>
+  <img src="docs/img/chat.png" alt="Chat: messages of the selected channel" width="240">
+  &nbsp;
+  <img src="docs/img/nodes.png" alt="Nodes: the freshest nodes with age and signal" width="240">
+  &nbsp;
+  <img src="docs/img/find.png" alt="Find: signal scale, trend and distance estimate for one node" width="240">
+</p>
+
+*Chat* shows the channel you picked (the **Ch** button below cycles the channels; **Msg** / **All** filters, **X** clears the
+screen). *Nodes* lists the freshest 14 nodes; **All heard** opens every node ever seen. Tap a node (or press Select) to open
+*Find*: signal scale, a CLOSE/FAR word, a WARMER/COLDER trend while you walk, a rough distance, and the **Info** and **Route**
+pages. The signal figure in the lists is relative (a HackRF is not a calibrated receiver); SNR is the number to trust.
+
 ## What it does
 
 - **Chat**: texts of the channel you pick (`Ch` button cycles your channels; up to ten, each with its own history on the card).
