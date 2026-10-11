@@ -57,7 +57,7 @@ index f3bd55e..e267655 100644
      // neither its name nor its public key. Ask. It is the same request the phone app
      // calls "exchange user info", and it is what fills the node list with names.
 diff --git a/firmware/application/apps/ui_meshtastic.cpp b/firmware/application/apps/ui_meshtastic.cpp
-index c6181f9..1dad4a9 100644
+index c6181f9..d4f9c71 100644
 --- a/firmware/application/apps/ui_meshtastic.cpp
 +++ b/firmware/application/apps/ui_meshtastic.cpp
 @@ -6,7 +6,6 @@
@@ -1168,7 +1168,64 @@ index c6181f9..1dad4a9 100644
  // A glyph table from the card, so the chat can show an alphabet the firmware font
  // does not carry. Absent, unreadable or malformed, nothing happens at all and those
  // characters keep their placeholder: the file is an addition, never a requirement.
-@@ -2234,10 +1236,8 @@ void MeshtasticChatView::load_history() {
+@@ -2141,16 +1143,23 @@ MeshtasticChatView::~MeshtasticChatView() {
+ // Codepoint ranges rather than one built-in script, so the same file serves Cyrillic,
+ // Greek, Hebrew or the accented Latin letters Latin-1 leaves out, and the choice
+ // belongs to whoever holds the card. tools/lora_bench/gen_font.py writes it.
++static const char* g_glyph_fail = "";  // why the last glyph table was not loaded
++
+ static bool load_one_table(const char16_t* path, uint8_t want_w, uint8_t want_h, GlyphTable& out, uint32_t max_glyphs, uint32_t keyboard_bytes) {
+     if (out.data) return true;
+     auto f = std::make_unique<File>();
+-    if (f->open(path).is_valid()) return false;
++    if (f->open(path).is_valid()) {
++        g_glyph_fail = "no file";
++        return false;
++    }
+ 
+     uint8_t head[8 + MeshConsole::MAX_RANGES * 3];
+     const auto rd = f->read(head, 8);
+     if (!rd || *rd != 8) return false;
+-    if (memcmp(head, "MGF1", 4) != 0) return false;
+-    if (head[4] != want_w || head[5] != want_h) return false;
++    if (memcmp(head, "MGF1", 4) != 0 || head[4] != want_w || head[5] != want_h) {
++        g_glyph_fail = "bad file";
++        return false;
++    }
+     const uint8_t nranges = head[6];
+     if (!nranges || nranges > MeshConsole::MAX_RANGES) return false;
+     const size_t rbytes = static_cast<size_t>(nranges) * 3u;
+@@ -2172,9 +1181,15 @@ static bool load_one_table(const char16_t* path, uint8_t want_w, uint8_t want_h,
+     const uint8_t stride = static_cast<uint8_t>((want_w * want_h + 7) / 8);
+     const size_t bytes = total * stride;
+     // Reading is not worth more than typing: leave the keyboard its room.
+-    if (chCoreStatus() < bytes + keyboard_bytes + 512u) return false;
++    if (chCoreStatus() < bytes + keyboard_bytes + 512u) {
++        g_glyph_fail = "low memory";
++        return false;
++    }
+     uint8_t* const table = static_cast<uint8_t*>(chHeapAlloc(0x0, bytes));
+-    if (!table) return false;
++    if (!table) {
++        g_glyph_fail = "low memory";
++        return false;
++    }
+     const auto gr = f->read(table, bytes);
+     if (!gr || *gr != bytes) {
+         chHeapFree(table);
+@@ -2203,6 +1218,11 @@ void MeshtasticChatView::load_ext_font() {
+     (void)big;
+ }
+ 
++void MeshtasticChatView::note_glyphs() {
++    if (display_.glyph_font && !console_.has_ext_font())
++        console_.write(std::string("(no glyphs: ") + g_glyph_fail + ", free " + to_string_dec_uint(chCoreStatus()) + " B)\n");
++}
++
+ void MeshtasticChatView::load_history() {
+     if (!display_.save_count) return;
+     auto f = std::make_unique<File>();
+@@ -2234,10 +1254,8 @@ void MeshtasticChatView::load_history() {
      uint32_t replayed = 0;
      std::string l;  // one string, reused by every line
      size_t from = start;
@@ -1179,7 +1236,7 @@ index c6181f9..1dad4a9 100644
          l.assign(hist_buf + from, i - from);
          from = i + 1;
          // Tolerate both line endings, including files written by the older code.
-@@ -2253,8 +1253,7 @@ void MeshtasticChatView::load_history() {
+@@ -2253,8 +1271,7 @@ void MeshtasticChatView::load_history() {
              // The delivery byte is the second in the record, and its offset is what a
              // pending message remembers - so a line still being retried gets its tag
              // back and the counter finds it again.
@@ -1189,7 +1246,7 @@ index c6181f9..1dad4a9 100644
          } else if (l.size() > 2 && l[0] >= 'A' && l[0] <= 'Z' && l[1] == '[') {
              // One build wrote the colour as a letter before the timestamp. Read it back
              // rather than leave a stray capital at the start of every old line.
-@@ -2314,54 +1313,7 @@ void MeshtasticChatView::load_history() {
+@@ -2314,54 +1331,7 @@ void MeshtasticChatView::load_history() {
          f.reset();
          delete_file(path);
          rename_file(tmp, path);
@@ -1244,7 +1301,7 @@ index c6181f9..1dad4a9 100644
  }
  
  void MeshtasticChatView::paint(Painter& painter) {
-@@ -2391,79 +1343,7 @@ void MeshtasticChatView::paint(Painter& painter) {
+@@ -2391,96 +1361,24 @@ void MeshtasticChatView::paint(Painter& painter) {
      painter.fill_rectangle({px + 4, py + 10, 1, 3}, bg);  // keyhole slot
  }
  
@@ -1260,12 +1317,24 @@ index c6181f9..1dad4a9 100644
 -        .foreground = Color::white()};
 -    set_style(&plain);
 -    set_dirty();
--}
--
++void MeshtasticChatView::set_pkt_indicator(bool tx) {
++    // Only touch the Text widget - a view-level set_dirty() here repaints the
++    // Console child too, and Console::paint() re-writes its last line
++    // (ui_widget.cpp: paint -> write(buffer)), so every packet/TX event was
++    // visually duplicating the newest chat line.
++    text_pkt_.set(tx ? " TX " : " RX ");
+ }
+ 
 -void RadioModeText::on_focus() {
 -    restyle(true);
 -}
--
++void MeshtasticChatView::on_packet(const MeshPacket& pkt) {
++    const std::string from_hex = to_string_hex(pkt.header.from, 8);
++    const NodeEntry* ne = node_db_.find(pkt.header.from);
++    const std::string from_name = (ne && ne->long_name[0])
++                                      ? std::string(ne->long_name)
++                                      : from_hex;
+ 
 -void RadioModeText::on_blur() {
 -    restyle(false);
 -}
@@ -1319,12 +1388,32 @@ index c6181f9..1dad4a9 100644
 -    }
 -}
 -
- void MeshtasticChatView::set_pkt_indicator(bool tx) {
+-void MeshtasticChatView::set_pkt_indicator(bool tx) {
 -    if (radio_mode_) return;  // a locked direction stays as it is drawn
-     // Only touch the Text widget - a view-level set_dirty() here repaints the
-     // Console child too, and Console::paint() re-writes its last line
-     // (ui_widget.cpp: paint -> write(buffer)), so every packet/TX event was
-@@ -2546,8 +1426,7 @@ void MeshtasticChatView::on_packet(const MeshPacket& pkt) {
+-    // Only touch the Text widget - a view-level set_dirty() here repaints the
+-    // Console child too, and Console::paint() re-writes its last line
+-    // (ui_widget.cpp: paint -> write(buffer)), so every packet/TX event was
+-    // visually duplicating the newest chat line.
+-    text_pkt_.set(tx ? " TX " : " RX ");
+-}
+-
+-void MeshtasticChatView::on_packet(const MeshPacket& pkt) {
+-    const std::string from_hex = to_string_hex(pkt.header.from, 8);
+-    const NodeEntry* ne = node_db_.find(pkt.header.from);
+-    const std::string from_name = (ne && ne->long_name[0])
+-                                      ? std::string(ne->long_name)
+-                                      : from_hex;
+-
+-    // Chat shows TEXT only. NODEINFO/POSITION/TELEMETRY/ROUTING already update the
+-    // Nodes + Data tabs via the router dispatch, so keep them out of the chat.
+-    if (pkt.data.portnum != PortNum::TEXT_MESSAGE) return;
++    // Chat shows TEXT only. NODEINFO/POSITION/TELEMETRY/ROUTING already update the
++    // Nodes + Data tabs via the router dispatch, so keep them out of the chat.
++    if (pkt.data.portnum != PortNum::TEXT_MESSAGE) return;
+ 
+     ChatMessage m;
+     m.from_name = from_name;
+@@ -2546,8 +1444,7 @@ void MeshtasticChatView::on_packet(const MeshPacket& pkt) {
      // Anything from another conversation is filed there and only announced here, so a
      // channel's history stays that channel's history.
      bool rang = false;  // a bell chimed for this message, so no second sound
@@ -1334,7 +1423,7 @@ index c6181f9..1dad4a9 100644
      if (here) {
          console_.set_message_index(messages_.size() - 1);  // tap this line for details
          // Start clean: these flags are raised by anything the console renders, and
-@@ -2606,554 +1485,6 @@ void MeshtasticChatView::on_packet(const MeshPacket& pkt) {
+@@ -2606,554 +1503,6 @@ void MeshtasticChatView::on_packet(const MeshPacket& pkt) {
      set_pkt_indicator(false);
  }
  
@@ -1889,7 +1978,7 @@ index c6181f9..1dad4a9 100644
  // ============================================================================
  // MeshtasticNodesView
  // ============================================================================
-@@ -3162,7 +1493,7 @@ MeshtasticNodesView::MeshtasticNodesView(NavigationView& nav,
+@@ -3162,7 +1511,7 @@ MeshtasticNodesView::MeshtasticNodesView(NavigationView& nav,
                                           NodeDB& node_db,
                                           Rect parent_rect)
      : View(parent_rect), nav_(nav), node_db_(node_db) {
@@ -1898,7 +1987,7 @@ index c6181f9..1dad4a9 100644
      // The list itself also takes focus so the encoder / D-pad move the selection and
      // Select opens the node detail.
      set_focusable(true);
-@@ -3186,10 +1517,6 @@ MeshtasticNodesView::MeshtasticNodesView(NavigationView& nav,
+@@ -3186,10 +1535,6 @@ MeshtasticNodesView::MeshtasticNodesView(NavigationView& nav,
      button_clear_.on_dir = row_nav;
      button_sort_.on_dir = row_nav;
      button_all_.on_dir = row_nav;
@@ -1909,7 +1998,16 @@ index c6181f9..1dad4a9 100644
  }
  
  size_t MeshtasticNodesView::online_count() const {
-@@ -3302,12 +1629,10 @@ void MeshtasticNodesView::move_selection(int delta) {
+@@ -3231,7 +1576,7 @@ void MeshtasticNodesView::rebuild_order() {
+                 return na < nb;
+             }
+             case Sort::Signal:
+-                return a->last_rssi < b->last_rssi;
++                return static_cast<float>(a->last_snr) < static_cast<float>(b->last_snr);
+             default:
+                 return a->last_seen_uptime < b->last_seen_uptime;
+         }
+@@ -3302,12 +1647,10 @@ void MeshtasticNodesView::move_selection(int delta) {
  }
  
  void MeshtasticNodesView::open_selected() {
@@ -1924,7 +2022,25 @@ index c6181f9..1dad4a9 100644
  }
  
  bool MeshtasticNodesView::on_encoder(const EncoderEvent delta) {
-@@ -3448,6 +1773,316 @@ void MeshtasticNodesView::refresh() {
+@@ -3384,7 +1727,7 @@ void MeshtasticNodesView::paint(Painter& painter) {
+     };
+     painter.draw_string({x0, y0}, hdr,
+                         "ID" + std::string(arrow(Sort::Id)) + "  Name" + arrow(Sort::Name) +
+-                            "          dBm" + arrow(Sort::Signal) + " Age" + arrow(Sort::Age));
++                            "          SNR" + arrow(Sort::Signal) + " Age" + arrow(Sort::Age));
+     painter.draw_hline({x0, y0 + HDR_H - 2}, screen_width, hdr.foreground);
+ 
+     // "12s" / "5m" / "3h" since a node was last heard.
+@@ -3417,7 +1760,7 @@ void MeshtasticNodesView::paint(Painter& painter) {
+         // Fourteen characters, not nine: the two number columns were sitting well
+         // short of the right edge, and a name is the thing you actually read.
+         // Cut by characters and drawn through the glyph table, so Cyrillic names come out as letters.
+-        std::string sig = (e->last_rssi != 0) ? to_string_dec_int(e->last_rssi) : "--";
++        std::string sig = (e->last_rssi != 0 || e->last_snr != 0) ? to_string_dec_int(static_cast<int>(static_cast<float>(e->last_snr))) : "--";
+         sig.resize(4, ' ');
+         painter.draw_string({x0, y}, st, id);
+         draw_utf8({x0 + 5 * 8, y}, utf8_cols(name, 14), st.foreground, st.background);
+@@ -3448,6 +1791,316 @@ void MeshtasticNodesView::refresh() {
      set_dirty();
  }
  
@@ -2241,14 +2357,25 @@ index c6181f9..1dad4a9 100644
  // ============================================================================
  // MeshtasticSeenView
  // ============================================================================
-@@ -3588,3507 +2223,155 @@ void MeshtasticSeenView::paint(Painter& painter) {
+@@ -3564,7 +2217,7 @@ void MeshtasticSeenView::paint(Painter& painter) {
+     const int x0 = r.left();
+     const int y0 = r.top();
+     painter.fill_rectangle({x0, y0, screen_width, r.height()}, bg);
+-    painter.draw_string({x0, y0}, hdr, "ID    Name          dBm  Age");
++    painter.draw_string({x0, y0}, hdr, "ID    Name          sig  Age");
+     painter.draw_hline({x0, y0 + HDR_H - 2}, screen_width, hdr.foreground);
+ 
+     for (int i = 0; i < rows_n_; i++) {
+@@ -3588,3507 +2241,155 @@ void MeshtasticSeenView::paint(Painter& painter) {
                              to_string_dec_uint(static_cast<uint32_t>(scroll_ + 1)) + "-)");
  }
  
--// ============================================================================
++
+ // ============================================================================
 -// MeshtasticMapView
--// ============================================================================
--
++// MeshtasticView (receive-only controller)
+ // ============================================================================
+ 
 -MeshtasticMapView::MeshtasticMapView(NavigationView& nav,
 -                                     NodeDB& node_db,
 -                                     Rect parent_rect)
@@ -2537,12 +2664,11 @@ index c6181f9..1dad4a9 100644
 -    up_text_ = s;
 -    text_up_.set(s);
 -}
- 
- // ============================================================================
+-
+-// ============================================================================
 -// Telemetry pages
-+// MeshtasticView (receive-only controller)
- // ============================================================================
- 
+-// ============================================================================
+-
 -MeshTelemetryMenuView::MeshTelemetryMenuView(NavigationView& nav, MeshSettings& cfg, MeshSettingsHooks& hooks)
 -    : MeshSettingsPage(nav, cfg, hooks) {
 -    add_children({&button_device_, &button_position_, &button_sensors_, &button_timing_});
@@ -5886,7 +6012,7 @@ index c6181f9..1dad4a9 100644
  }
  
  size_t MeshtasticView::derive_channel_key(const std::string& text, uint8_t out[32]) {
-@@ -7118,12 +2401,203 @@ size_t MeshtasticView::derive_channel_key(const std::string& text, uint8_t out[3
+@@ -7118,12 +2419,203 @@ size_t MeshtasticView::derive_channel_key(const std::string& text, uint8_t out[3
      return 16;
  }
  
@@ -6095,7 +6221,7 @@ index c6181f9..1dad4a9 100644
      if (cfg_.primary_name.empty()) {
          channel_hash_ = meshtastic::preset_channel_hash(cfg_.preset_idx, DEFAULT_PSK,
                                                          sizeof(DEFAULT_PSK));
-@@ -7132,7 +2606,7 @@ void MeshtasticView::apply_channels() {
+@@ -7132,7 +2624,7 @@ void MeshtasticView::apply_channels() {
                                                   sizeof(DEFAULT_PSK));
      }
      router_.set_channel(0, channel_hash_, DEFAULT_PSK, sizeof(DEFAULT_PSK), true);
@@ -6104,7 +6230,7 @@ index c6181f9..1dad4a9 100644
      for (int i = 0; i < MeshSettings::NUM_CUSTOM; i++) {
          const bool on = cfg_.ch_enabled[i] && !cfg_.ch_name[i].empty();
          if (on) {
-@@ -7148,46 +2622,28 @@ void MeshtasticView::apply_channels() {
+@@ -7148,46 +2640,28 @@ void MeshtasticView::apply_channels() {
      if (cfg_.active_channel > MeshSettings::NUM_CUSTOM) cfg_.active_channel = 0;
      if (cfg_.active_channel != 0 &&
          !(cfg_.ch_enabled[cfg_.active_channel - 1] && !cfg_.ch_name[cfg_.active_channel - 1].empty()))
@@ -6171,7 +6297,7 @@ index c6181f9..1dad4a9 100644
  }
  
  void MeshtasticView::save_known_nodes() {
-@@ -7284,178 +2740,74 @@ void MeshtasticView::load_known_nodes() {
+@@ -7284,178 +2758,74 @@ void MeshtasticView::load_known_nodes() {
      }
  }
  
@@ -6402,7 +6528,7 @@ index c6181f9..1dad4a9 100644
  
  }  // namespace ui
 diff --git a/firmware/application/apps/ui_meshtastic.hpp b/firmware/application/apps/ui_meshtastic.hpp
-index 695c7b4..bd67359 100644
+index 695c7b4..ce2e354 100644
 --- a/firmware/application/apps/ui_meshtastic.hpp
 +++ b/firmware/application/apps/ui_meshtastic.hpp
 @@ -508,6 +508,7 @@ struct MeshSettings {
@@ -6654,7 +6780,7 @@ index 695c7b4..bd67359 100644
      void set_last_signal(int8_t rssi, int16_t snr_tenths) {
          if (!rssi && !snr_tenths) return;
          text_rssi_.set(to_string_dec_int(rssi) + "/" +
-@@ -982,74 +782,40 @@ class MeshtasticChatView : public View {
+@@ -982,85 +782,54 @@ class MeshtasticChatView : public View {
          else
              console_.write(s);
      }
@@ -6710,6 +6836,7 @@ index 695c7b4..bd67359 100644
      void load_deferred() {
          load_ext_font();
          load_history();
++        note_glyphs();
      }
 -    // Open a direct-message thread with a node (node detail "Message" button, or a
 -    // thread picked from the Channels list): outgoing text becomes unicast to it and
@@ -6721,6 +6848,8 @@ index 695c7b4..bd67359 100644
 -    uint32_t open_dm() const {
 -        return (dest_id_ == meshtastic::BROADCAST_ADDR) ? 0 : dest_id_;
 -    }
++    // One plain line (not a hidden status line) when the Cyrillic tables were asked for and did not load.
++    void note_glyphs();
  
     private:
 -    // A glyph table read from the card at startup, for alphabets the firmware font does
@@ -6731,11 +6860,12 @@ index 695c7b4..bd67359 100644
 -    // What AlphanumView asks for the first time a text prompt opens in a session. The
 -    // glyph table must never eat into it: a device that cannot be typed on is worse
 -    // than one that cannot show every alphabet.
+-    static constexpr uint32_t KEYBOARD_BYTES = 4848;
 +    // Slack the glyph table must leave in core memory.
-     static constexpr uint32_t KEYBOARD_BYTES = 4848;
++    static constexpr uint32_t KEYBOARD_BYTES = 0;  // Reader has no on-screen keyboard to leave room for
      uint8_t* ext_font_{nullptr};
      bool ext_font_short_{false};  // a table was there, but loading it would have hurt
-@@ -1057,10 +823,10 @@ class MeshtasticChatView : public View {
+     void load_ext_font();
  
      static constexpr int SV_H = 280;
      static constexpr int STATUS_H = 16;
@@ -6749,7 +6879,7 @@ index 695c7b4..bd67359 100644
  
      NavigationView& nav_;
      meshtastic::MeshRouter& router_;
-@@ -1068,61 +834,26 @@ class MeshtasticChatView : public View {
+@@ -1068,61 +837,26 @@ class MeshtasticChatView : public View {
  
      std::vector<ChatMessage> messages_{};
      static constexpr size_t MAX_MESSAGES = 16;
@@ -6816,7 +6946,7 @@ index 695c7b4..bd67359 100644
      void switch_conversation();
  
      Labels labels_rf_{
-@@ -1132,185 +863,22 @@ class MeshtasticChatView : public View {
+@@ -1132,185 +866,22 @@ class MeshtasticChatView : public View {
      NumberField field_lna_{{2 * 8, 0}, 2, {0, 40}, 8, ' '};
      NumberField field_vga_{{6 * 8, 0}, 2, {0, 62}, 2, ' '};
      NumberField field_amp_{{10 * 8, 0}, 1, {0, 1}, 1, ' '};
@@ -7009,7 +7139,7 @@ index 695c7b4..bd67359 100644
  class MeshtasticSeenView : public View {
     public:
      MeshtasticSeenView(NavigationView& nav, meshtastic::NodeDB& node_db, uint32_t now_ticks);
-@@ -1350,6 +918,49 @@ class MeshtasticSeenView : public View {
+@@ -1350,6 +921,49 @@ class MeshtasticSeenView : public View {
      void scroll_by(int delta);
  };
  
@@ -7059,7 +7189,7 @@ index 695c7b4..bd67359 100644
  // ---- Tab: Nodes  (index 1) -------------------------------------------------
  
  class MeshtasticNodesView : public View {
-@@ -1365,13 +976,10 @@ class MeshtasticNodesView : public View {
+@@ -1365,13 +979,10 @@ class MeshtasticNodesView : public View {
      bool on_key(const KeyEvent key) override;
      bool on_touch(const TouchEvent event) override;
      void refresh();
@@ -7077,7 +7207,7 @@ index 695c7b4..bd67359 100644
      // Current uptime (ticks) for "last heard" ages; repaints ~1/s while shown.
      void set_now(uint32_t ticks) {
          if (!hidden() && ticks >= now_ticks_ + 60) set_dirty();
-@@ -1397,13 +1005,12 @@ class MeshtasticNodesView : public View {
+@@ -1397,13 +1008,12 @@ class MeshtasticNodesView : public View {
      NavigationView& nav_;
      meshtastic::NodeDB& node_db_;
  
@@ -7093,7 +7223,7 @@ index 695c7b4..bd67359 100644
      // Newest first by default: a node that just appeared is the interesting one.
      Sort sort_{Sort::Age};
      bool sort_desc_{true};
-@@ -1434,963 +1041,73 @@ class MeshtasticNodesView : public View {
+@@ -1434,963 +1044,73 @@ class MeshtasticNodesView : public View {
      // at best - so the button now carries it, and says which way round it is.
      Button button_sort_{{60, BOT_Y, 57, BOT_H}, "Age v"};
      // Every node heard, including the ones the table had no room for (see MeshtasticSeenView).
@@ -8075,7 +8205,7 @@ index 695c7b4..bd67359 100644
  
      MessageHandlerRegistration handler_lora_{
          Message::ID::LoRaPacket,
-@@ -2398,33 +1115,10 @@ class MeshtasticView : public View {
+@@ -2398,33 +1118,10 @@ class MeshtasticView : public View {
              on_lora_packet(static_cast<const LoRaPacketMessage*>(p));
          }};
  
