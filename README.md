@@ -67,6 +67,18 @@ scripts/build.sh   # needs Docker; fetches PR #3306 at the tested commit 51135ec
 Output: `dist/mesh-reader-4/{FIRMWARE,APPS,BASEBAND}`. The full-featured variant with sending lives in
 [portapack-mesh](https://github.com/osahv/portapack-mesh).
 
+## Upstream
+
+The Mesh app itself is [Mayhem PR #3306](https://github.com/portapack-mayhem/mayhem-firmware/pull/3306) by verhogladov and is
+not merged yet. The general improvements made here (256-bit channel keys, 14-node table, the All list, the Nodes tab focus fix)
+are offered back to its author as [verhogladov/mayhem-firmware#1](https://github.com/verhogladov/mayhem-firmware/pull/1). The
+receive-only build, the Find screen and the changed baseband placement stay in this project. The full-featured variant with
+sending lives in [portapack-mesh](https://github.com/osahv/portapack-mesh).
+
+## Settings reference
+
+Every key of `meshtastic.ini` is described in [docs/ini-reference.md](docs/ini-reference.md).
+
 ## Credits and license
 
 - The Mesh app and the LoRa modem: **verhogladov** ([PR #3306](https://github.com/portapack-mayhem/mayhem-firmware/pull/3306)).
